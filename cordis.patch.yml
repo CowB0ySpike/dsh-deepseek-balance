@@ -1,0 +1,5 @@
+# Inserts the DeepSeek balance row: the Host half serves one read-only
+# `/deepseek-balance` route, the Client half renders the dock entry.
+- insert:
+    - id: deepseek-balance
+      name: dsh-deepseek-balance
