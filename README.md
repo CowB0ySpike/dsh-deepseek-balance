@@ -5,7 +5,7 @@
 一个 12px 的 dock 条目，与 activity / usage 同处一行；点击右侧刷新按钮立即重新查询。API Key 始终留在 Host 进程内，浏览器只会收到余额与状态。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![DSH](https://img.shields.io/badge/DSH-plugin-5c6ac4.svg)](#)
+![DSH plugin](https://img.shields.io/badge/DSH-plugin-5c6ac4.svg)
 
 ```
 余额 ¥123.45 ↻
