@@ -21,11 +21,12 @@ const ZAI_HOST = 'https://api.z.ai';
 const BIGMODEL_HOST = 'https://open.bigmodel.cn';
 const CASH_PATH = '/api/biz/account/query-customer-account-report';
 const QUOTA_PATH = '/api/monitor/usage/quota/limit';
+const PACKAGES_PATH = '/api/biz/tokenAccounts/list/my';
 const DEFAULT_CACHE_TTL_MS = 60_000;
 const DEFAULT_TIMEOUT_MS = 10_000;
 const ERROR_CACHE_TTL_MS = 5_000;
 const ROUTE_PATH = '/deepseek-balance';
-const USER_AGENT = 'dsh-deepseek-balance/1.2.0';
+const USER_AGENT = 'dsh-deepseek-balance/1.3.0';
 
 /**
  * Known provider routes. `ref` is the credential reference DSH itself uses for
@@ -308,7 +309,8 @@ function glmStations(known, options) {
 
 /**
  * Read a GLM cash balance, falling back to coding-plan quota when the account
- * has no cash report (subscription keys).
+ * has no cash report (subscription keys). The answering station's token
+ * packages (资源包) are attached when present.
  *
  * @param known - provider descriptor.
  * @param key - resolved API key.
@@ -322,14 +324,18 @@ async function readGlm(known, key, options, provider, model) {
 	const cash = await Promise.all(
 		stations.map((station) => readGlmCash(known, key, station, options.timeoutMs, provider, model)),
 	);
-	const picked = pickCash(cash);
-	if (picked !== undefined) return picked;
+	const picked = pickCashIndex(cash);
+	if (picked >= 0) {
+		return withPackages(key, stations[picked], cash[picked].payload, options, provider, model);
+	}
 
 	const quota = await Promise.all(
 		stations.map((station) => readGlmQuota(known, key, station, options.timeoutMs, provider, model)),
 	);
-	const quotaResult = quota.find((result) => result.payload !== undefined);
-	if (quotaResult !== undefined) return quotaResult.payload;
+	const quotaIndex = quota.findIndex((result) => result.payload !== undefined);
+	if (quotaIndex >= 0) {
+		return withPackages(key, stations[quotaIndex], quota[quotaIndex].payload, options, provider, model);
+	}
 
 	const preferred = Math.max(
 		0,
@@ -339,15 +345,92 @@ async function readGlm(known, key, options, provider, model) {
 }
 
 /**
+ * Attach the station's token packages to a finished payload.
+ *
+ * @param key - resolved API key.
+ * @param station - the station that answered.
+ * @param payload - the cash or quota payload.
+ * @param options - resolved plugin options.
+ * @returns the payload, with `packages` when the account has any.
+ */
+async function withPackages(key, station, payload, options) {
+	const packages = await readGlmPackages(key, station, options.timeoutMs);
+	if (packages.length > 0) payload.packages = packages;
+	return payload;
+}
+
+/**
+ * Read the station's granted token packages (资源包).
+ *
+ * @param key - resolved API key.
+ * @param station - station descriptor.
+ * @param timeoutMs - per-request timeout.
+ * @returns package rows, possibly empty; read failures degrade to empty.
+ */
+async function readGlmPackages(key, station, timeoutMs) {
+	const result = await fetchJson(
+		`${station.host}${PACKAGES_PATH}?pageNum=1&pageSize=100`,
+		{ authorization: `Bearer ${key}`, accept: 'application/json', 'user-agent': USER_AGENT },
+		timeoutMs,
+	);
+	if (result.failure !== undefined) return [];
+	if (result.status < 200 || result.status >= 300) return [];
+	if (businessFailure(result.body) !== undefined) return [];
+	const rows = result.body?.rows ?? result.body?.data?.rows;
+	if (!Array.isArray(rows)) return [];
+
+	const packages = [];
+	for (const row of rows) {
+		if (row === null || typeof row !== 'object') continue;
+		const status = text(row.status);
+		const remaining = numberOf(row.tokenBalance);
+		if (status !== 'EFFECTIVE' && remaining === undefined) continue;
+		const magnitude = numberOf(row.tokensMagnitude) ?? 1;
+		packages.push({
+			name: text(row.resourcePackageName) ?? 'token package',
+			remaining: numberOrZero(remaining) * magnitude,
+			model: text(row.suitableModel),
+			expiresAt: packageExpiry(row),
+		});
+	}
+	return packages;
+}
+
+/**
+ * Best-effort expiry extraction from a package row.
+ *
+ * @param row - one raw package row.
+ * @returns the expiry in epoch milliseconds, or undefined.
+ */
+function packageExpiry(row) {
+	for (const field of ['expireTime', 'validEndTime', 'endTime', 'expireAt', 'validUntil']) {
+		const value = row[field];
+		if (value === undefined || value === null) continue;
+		if (typeof value === 'number' && Number.isFinite(value)) {
+			return value < 1e12 ? value * 1000 : value;
+		}
+		if (typeof value === 'string' && value.trim() !== '') {
+			const parsed = Date.parse(value);
+			if (Number.isFinite(parsed)) return parsed;
+		}
+	}
+	return undefined;
+}
+
+/**
  * Choose the cash payload to display.
  *
  * @param results - per-station cash results.
- * @returns the payload, or undefined.
+ * @returns the index of the chosen result, or -1.
  */
-function pickCash(results) {
-	const payloads = results.map((result) => result.payload).filter((payload) => payload !== undefined);
-	if (payloads.length === 0) return undefined;
-	return payloads.find(isFunded) ?? payloads[0];
+function pickCashIndex(results) {
+	let firstSuccess = -1;
+	for (let index = 0; index < results.length; index++) {
+		if (results[index].payload === undefined) continue;
+		if (firstSuccess === -1) firstSuccess = index;
+		if (isFunded(results[index].payload)) return index;
+	}
+	return firstSuccess;
 }
 
 /**

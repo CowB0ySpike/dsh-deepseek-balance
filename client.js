@@ -27,6 +27,8 @@ window.__ModuleLoader__.load({
         frozen: '冻结',
         remaining: '剩余',
         resets: '重置',
+        validUntil: '有效期至',
+        packages: '资源包',
         window5h: '5 小时',
         weekly: '本周',
         web: '联网搜索',
@@ -49,6 +51,8 @@ window.__ModuleLoader__.load({
         frozen: 'frozen',
         remaining: 'remaining',
         resets: 'resets',
+        validUntil: 'valid until',
+        packages: 'token packages',
         window5h: '5h',
         weekly: 'Week',
         web: 'Web',
@@ -111,6 +115,62 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Compact token count for a dock row or tooltip.
+     * @param {number} value - remaining tokens.
+     * @returns {string} the compact form, e.g. `4.8M`.
+     */
+    function formatTokens(value) {
+      if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return '0';
+      const compact = (divisor) => {
+        const scaled = Math.round((value / divisor) * 10) / 10;
+        return String(scaled);
+      };
+      if (value >= 1e9) return `${compact(1e9)}B`;
+      if (value >= 1e6) return `${compact(1e6)}M`;
+      if (value >= 1e3) return `${compact(1e3)}K`;
+      return String(Math.round(value));
+    }
+
+    /**
+     * Short date for a package expiry.
+     * @param {number | undefined} expiresAt - epoch milliseconds.
+     * @returns {string} the date, or an empty string.
+     */
+    function expiryText(expiresAt) {
+      if (typeof expiresAt !== 'number' || !Number.isFinite(expiresAt)) return '';
+      return new Date(expiresAt).toLocaleDateString();
+    }
+
+    /**
+     * Summarize a payload's token packages for the row and the tooltip.
+     * @param {unknown} payload - Host payload.
+     * @param {(key: string) => string} t - translator.
+     * @returns {{ row: string, details: string[] }} the row suffix and detail lines.
+     */
+    function packageSummary(payload, t) {
+      const packages = Array.isArray(payload.packages) ? payload.packages : [];
+      if (packages.length === 0) return { row: '', details: [] };
+      let total = 0;
+      const details = [];
+      for (const entry of packages) {
+        const remaining = typeof entry?.remaining === 'number' ? entry.remaining : 0;
+        total += remaining;
+        const model = typeof entry?.model === 'string' ? entry.model : '';
+        const expiry = expiryText(entry?.expiresAt);
+        details.push(
+          [
+            `${entry?.name ?? t('packages')} ${formatTokens(remaining)}`,
+            model.length > 0 ? model : '',
+            expiry.length > 0 ? `${t('validUntil')} ${expiry}` : '',
+          ]
+            .filter((part) => part.length > 0)
+            .join(' · '),
+        );
+      }
+      return { row: ` · ${t('packages')} ${formatTokens(total)}`, details };
+    }
+
+    /**
      * Map one Host payload to a render-ready view.
      * @param {unknown} payload - Host JSON.
      * @param {(key: string) => string} t - translator.
@@ -137,12 +197,15 @@ window.__ModuleLoader__.load({
             `${quotaLabel(t, entry.id)} ${t('remaining')} ${Math.round(remaining)}%${reset.length > 0 ? ` (${t('resets')} ${reset})` : ''}`,
           );
         }
+        const packages = packageSummary(payload, t);
         return {
           kind: 'quota',
           provider: payload.providerName ?? payload.provider ?? '',
-          text: parts.length > 0 ? parts.join(' · ') : t('unknown'),
+          text: (parts.length > 0 ? parts.join(' · ') : t('unknown')) + packages.row,
           low: lowest < 10,
-          detail: [selectionLine(payload, t), ...details].filter((line) => line.length > 0).join('\n'),
+          detail: [selectionLine(payload, t), ...details, ...packages.details]
+            .filter((line) => line.length > 0)
+            .join('\n'),
         };
       }
       if (payload.status === 'ok' && payload.kind === 'cash') {
@@ -164,12 +227,15 @@ window.__ModuleLoader__.load({
             `${item.currency} ${t('granted')} ${symbol}${item.granted ?? ''} · ${t('toppedUp')} ${symbol}${item.toppedUp ?? ''}${extras.length > 0 ? ` · ${extras.join(' · ')}` : ''}`,
           );
         }
+        const packages = packageSummary(payload, t);
         return {
           kind: 'cash',
           provider: payload.providerName ?? payload.provider ?? '',
-          text: parts.length > 0 ? parts.join(' · ') : t('unknown'),
+          text: (parts.length > 0 ? parts.join(' · ') : t('unknown')) + packages.row,
           unavailable: payload.isAvailable === false,
-          detail: [selectionLine(payload, t), ...details].filter((line) => line.length > 0).join('\n'),
+          detail: [selectionLine(payload, t), ...details, ...packages.details]
+            .filter((line) => line.length > 0)
+            .join('\n'),
         };
       }
       if (payload.status === 'error') {

@@ -156,6 +156,24 @@ test('prefers the funded 智谱 station and reports CNY', async () => {
   const calls = [];
   const restore = withFetch(async (url) => {
     calls.push(url);
+    if (url.includes('tokenAccounts/list/my')) {
+      return new Response(
+        JSON.stringify({
+          code: 200,
+          rows: [
+            {
+              resourcePackageName: 'GLM-5.3-Flash 资源包',
+              tokenBalance: 2,
+              tokensMagnitude: 1000000,
+              status: 'EFFECTIVE',
+              suitableModel: 'glm-5.3-flash',
+              expireTime: '2026-12-31 23:59:59',
+            },
+          ],
+        }),
+        { status: 200 },
+      );
+    }
     if (url.startsWith('https://open.bigmodel.cn/')) {
       return new Response(JSON.stringify(cashBody(50)), { status: 200 });
     }
@@ -175,7 +193,16 @@ test('prefers the funded 智谱 station and reports CNY', async () => {
     assert.deepEqual(payload.balances, [
       { currency: 'CNY', total: '50.00', granted: '0.00', toppedUp: '50.00' },
     ]);
-    assert.ok(calls.some((url) => url.startsWith('https://open.bigmodel.cn/')));
+    assert.deepEqual(payload.packages, [
+      {
+        name: 'GLM-5.3-Flash 资源包',
+        remaining: 2000000,
+        model: 'glm-5.3-flash',
+        expiresAt: Date.parse('2026-12-31 23:59:59'),
+      },
+    ]);
+    assert.ok(calls.some((url) => url.includes('tokenAccounts/list/my')));
+    assert.ok(calls.every((url) => url.startsWith('https://open.bigmodel.cn/') || url.startsWith('https://api.z.ai/')));
   } finally {
     restore();
   }
