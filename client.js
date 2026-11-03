@@ -197,14 +197,14 @@ window.__ModuleLoader__.load({
           );
         }
         const packages = packageSummary(payload, t);
+        const lines = [selectionLine(payload, t), ...details].filter((line) => line.length > 0);
+        if (packages.details.length > 0) lines.push('', ...packages.details);
         return {
           kind: 'quota',
           provider: payload.providerName ?? payload.provider ?? '',
           text: parts.length > 0 ? parts.join(' · ') : t('unknown'),
           low: lowest < 10,
-          detail: [selectionLine(payload, t), ...details, ...packages.details]
-            .filter((line) => line.length > 0)
-            .join('\n'),
+          detail: lines.join('\n'),
         };
       }
       if (payload.status === 'ok' && payload.kind === 'cash') {
@@ -227,14 +227,14 @@ window.__ModuleLoader__.load({
           );
         }
         const packages = packageSummary(payload, t);
+        const lines = [selectionLine(payload, t), ...details].filter((line) => line.length > 0);
+        if (packages.details.length > 0) lines.push('', ...packages.details);
         return {
           kind: 'cash',
           provider: payload.providerName ?? payload.provider ?? '',
           text: parts.length > 0 ? parts.join(' · ') : t('unknown'),
           unavailable: payload.isAvailable === false,
-          detail: [selectionLine(payload, t), ...details, ...packages.details]
-            .filter((line) => line.length > 0)
-            .join('\n'),
+          detail: lines.join('\n'),
         };
       }
       if (payload.status === 'error') {
