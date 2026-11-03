@@ -142,19 +142,18 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Summarize a payload's token packages for the row and the tooltip.
+     * Summarize a payload's token packages for the tooltip. The dock row stays
+     * compact; packages are detail-only.
      * @param {unknown} payload - Host payload.
      * @param {(key: string) => string} t - translator.
-     * @returns {{ row: string, details: string[] }} the row suffix and detail lines.
+     * @returns {{ details: string[] }} the detail lines.
      */
     function packageSummary(payload, t) {
       const packages = Array.isArray(payload.packages) ? payload.packages : [];
-      if (packages.length === 0) return { row: '', details: [] };
-      let total = 0;
+      if (packages.length === 0) return { details: [] };
       const details = [];
       for (const entry of packages) {
         const remaining = typeof entry?.remaining === 'number' ? entry.remaining : 0;
-        total += remaining;
         const model = typeof entry?.model === 'string' ? entry.model : '';
         const expiry = expiryText(entry?.expiresAt);
         details.push(
@@ -167,7 +166,7 @@ window.__ModuleLoader__.load({
             .join(' · '),
         );
       }
-      return { row: ` · ${t('packages')} ${formatTokens(total)}`, details };
+      return { details };
     }
 
     /**
@@ -201,7 +200,7 @@ window.__ModuleLoader__.load({
         return {
           kind: 'quota',
           provider: payload.providerName ?? payload.provider ?? '',
-          text: (parts.length > 0 ? parts.join(' · ') : t('unknown')) + packages.row,
+          text: parts.length > 0 ? parts.join(' · ') : t('unknown'),
           low: lowest < 10,
           detail: [selectionLine(payload, t), ...details, ...packages.details]
             .filter((line) => line.length > 0)
@@ -231,7 +230,7 @@ window.__ModuleLoader__.load({
         return {
           kind: 'cash',
           provider: payload.providerName ?? payload.provider ?? '',
-          text: (parts.length > 0 ? parts.join(' · ') : t('unknown')) + packages.row,
+          text: parts.length > 0 ? parts.join(' · ') : t('unknown'),
           unavailable: payload.isAvailable === false,
           detail: [selectionLine(payload, t), ...details, ...packages.details]
             .filter((line) => line.length > 0)

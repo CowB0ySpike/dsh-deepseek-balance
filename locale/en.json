@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "DeepSeek Balance",
-    "description": "Shows the configured DeepSeek API key account balance below the composer."
+    "title": "Model Balance",
+    "description": "Shows the current model provider's account balance, plan quota, and token packages below the composer."
   }
 }

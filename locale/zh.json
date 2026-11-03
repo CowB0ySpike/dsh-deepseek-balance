@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "DeepSeek 余额",
-    "description": "在输入框下方显示已配置的 DeepSeek API Key 账户余额。"
+    "title": "模型余额",
+    "description": "在输入框下方显示当前模型供应商的账户余额、套餐额度与资源包。"
   }
 }
