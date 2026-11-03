@@ -345,3 +345,26 @@ test('answers non-GET requests with 405', async () => {
   const { status } = await callRoute(routes, '/deepseek-balance', 'POST');
   assert.equal(status, 405);
 });
+
+test('debug=1 returns the raw GLM rows for the answering stations', async () => {
+  const calls = [];
+  const restore = withFetch(async (url) => {
+    calls.push(url);
+    if (url.includes('tokenAccounts/list/my')) {
+      return new Response(JSON.stringify({ code: 200, rows: [{ tokenBalance: 20, resourcePackageName: 'pkg' }] }), { status: 200 });
+    }
+    return new Response(JSON.stringify(cashBody(1)), { status: 200 });
+  });
+  try {
+    const { ctx, routes } = makeContext('zai');
+    apply(ctx, {});
+    const { payload } = await callRoute(routes, '/deepseek-balance?provider=zai&debug=1');
+    assert.equal(payload.provider, 'zai');
+    assert.equal(payload.ref, 'ZAI_API_KEY');
+    assert.equal(payload.stations.length, 2);
+    assert.deepEqual(payload.stations[0].body.rows, [{ tokenBalance: 20, resourcePackageName: 'pkg' }]);
+    assert.ok(calls.every((url) => url.includes('tokenAccounts/list/my')));
+  } finally {
+    restore();
+  }
+});

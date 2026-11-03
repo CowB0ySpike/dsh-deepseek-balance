@@ -174,6 +174,10 @@ export function apply(ctx, config) {
 					const requested = new URL(req.url ?? '/', 'http://localhost');
 					const provider = currentProvider(text(requested.searchParams.get('provider')));
 					const model = text(requested.searchParams.get('model'));
+					if (requested.searchParams.get('debug') === '1') {
+						sendJson(res, 200, await debugPayload(ctx, options, provider));
+						return;
+					}
 					const payload = await getBalance({ provider, model }, requested.searchParams.get('refresh') === '1');
 					sendJson(res, 200, payload);
 				} catch (error) {
@@ -186,6 +190,40 @@ export function apply(ctx, config) {
 			},
 		}),
 	);
+}
+
+/**
+ * Diagnostic: return the upstream token-package rows verbatim so the field
+ * semantics (`tokenBalance` / `tokensMagnitude`) can be verified against the
+ * console. Opt-in via `?debug=1` on the localhost-only route.
+ *
+ * @param ctx - plugin context.
+ * @param options - resolved options.
+ * @param provider - provider id.
+ * @returns raw per-station responses.
+ */
+async function debugPayload(ctx, options, provider) {
+	const known = providerOf(provider);
+	if (known === undefined || known.kind !== 'glm') {
+		return { note: 'debug is only implemented for GLM routes', provider };
+	}
+	const ref = options.apiKeyEnv ?? known.ref;
+	const resolved = await ctx.credentials.resolve(ref);
+	if (resolved === undefined || typeof resolved.value !== 'string' || resolved.value.length === 0) {
+		return { note: 'credential is not configured', ref };
+	}
+	const key = resolved.value;
+	const stations = glmStations(known, options);
+	const out = [];
+	for (const station of stations) {
+		const result = await fetchJson(
+			`${station.host}${PACKAGES_PATH}?pageNum=1&pageSize=100`,
+			{ authorization: `Bearer ${key}`, accept: 'application/json', 'user-agent': USER_AGENT },
+			options.timeoutMs,
+		);
+		out.push({ station: station.station, host: station.host, status: result.status, body: result.body ?? null });
+	}
+	return { provider, ref, stations: out };
 }
 
 /**
