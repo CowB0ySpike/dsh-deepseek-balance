@@ -162,12 +162,20 @@ test('prefers the funded 智谱 station and reports CNY', async () => {
           code: 200,
           rows: [
             {
-              resourcePackageName: 'GLM-5.3-Flash 资源包',
-              tokenBalance: 2,
-              tokensMagnitude: 1000000,
+              tokenBalance: 1386447,
+              tokensMagnitude: 5000000,
               status: 'EFFECTIVE',
+              resourcePackageName: '【实名认证】500万GLM-5.3-Flash体验包',
               suitableModel: 'glm-5.3-flash',
-              expireTime: '2026-12-31 23:59:59',
+              expirationTime: '2026-12-03T17:59:15',
+              consumeType: 'TOKENS',
+            },
+            {
+              tokenBalance: 16,
+              tokensMagnitude: 20,
+              status: 'EFFECTIVE',
+              resourcePackageName: '【新用户专享】20次图片/视频生成资源包',
+              consumeType: 'TIMES',
             },
           ],
         }),
@@ -195,10 +203,18 @@ test('prefers the funded 智谱 station and reports CNY', async () => {
     ]);
     assert.deepEqual(payload.packages, [
       {
-        name: 'GLM-5.3-Flash 资源包',
-        remaining: 2000000,
+        name: '【实名认证】500万GLM-5.3-Flash体验包',
+        remaining: 1386447,
+        grant: 5000000,
+        consumeType: 'TOKENS',
         model: 'glm-5.3-flash',
-        expiresAt: Date.parse('2026-12-31 23:59:59'),
+        expiresAt: Date.parse('2026-12-03T17:59:15+08:00'),
+      },
+      {
+        name: '【新用户专享】20次图片/视频生成资源包',
+        remaining: 16,
+        grant: 20,
+        consumeType: 'TIMES',
       },
     ]);
     assert.ok(calls.some((url) => url.includes('tokenAccounts/list/my')));

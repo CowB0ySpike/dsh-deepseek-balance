@@ -400,6 +400,11 @@ async function withPackages(key, station, payload, options) {
 /**
  * Read the station's granted token packages (资源包).
  *
+ * Verified against the live API: `tokenBalance` is the remaining amount in the
+ * package's native unit (tokens for `consumeType: TOKENS`, calls for TIMES),
+ * `tokensMagnitude` is the package's total grant (5000000 = 500万), and
+ * `expirationTime` is a naive UTC+8 timestamp.
+ *
  * @param key - resolved API key.
  * @param station - station descriptor.
  * @param timeoutMs - per-request timeout.
@@ -420,16 +425,21 @@ async function readGlmPackages(key, station, timeoutMs) {
 	const packages = [];
 	for (const row of rows) {
 		if (row === null || typeof row !== 'object') continue;
-		const status = text(row.status);
-		const remaining = numberOf(row.tokenBalance);
-		if (status !== 'EFFECTIVE' && remaining === undefined) continue;
-		const magnitude = numberOf(row.tokensMagnitude) ?? 1;
-		packages.push({
+		const remaining = numberOf(row.tokenBalance) ?? numberOf(row.availableBalance);
+		if (remaining === undefined) continue;
+		const entry = {
 			name: text(row.resourcePackageName) ?? 'token package',
-			remaining: numberOrZero(remaining) * magnitude,
-			model: text(row.suitableModel),
-			expiresAt: packageExpiry(row),
-		});
+			remaining,
+		};
+		const grant = numberOf(row.tokensMagnitude);
+		if (grant !== undefined) entry.grant = grant;
+		const consumeType = text(row.consumeType);
+		if (consumeType !== undefined) entry.consumeType = consumeType;
+		const model = text(row.suitableModel);
+		if (model !== undefined) entry.model = model;
+		const expiresAt = packageExpiry(row);
+		if (expiresAt !== undefined) entry.expiresAt = expiresAt;
+		packages.push(entry);
 	}
 	return packages;
 }
@@ -441,14 +451,16 @@ async function readGlmPackages(key, station, timeoutMs) {
  * @returns the expiry in epoch milliseconds, or undefined.
  */
 function packageExpiry(row) {
-	for (const field of ['expireTime', 'validEndTime', 'endTime', 'expireAt', 'validUntil']) {
+	for (const field of ['expirationTime', 'packageExpirationTime', 'expireTime', 'validEndTime', 'endTime', 'expireAt', 'validUntil']) {
 		const value = row[field];
 		if (value === undefined || value === null) continue;
 		if (typeof value === 'number' && Number.isFinite(value)) {
 			return value < 1e12 ? value * 1000 : value;
 		}
 		if (typeof value === 'string' && value.trim() !== '') {
-			const parsed = Date.parse(value);
+			// The platform writes naive timestamps in UTC+8.
+			const normalized = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(value.trim()) ? `${value.trim()}+08:00` : value;
+			const parsed = Date.parse(normalized);
 			if (Number.isFinite(parsed)) return parsed;
 		}
 	}

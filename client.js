@@ -142,6 +142,15 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Keep a finite number, dropping everything else.
+     * @param {unknown} value - any value.
+     * @returns {number | undefined} the number, or undefined.
+     */
+    function numberOr(value) {
+      return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+    }
+
+    /**
      * Summarize a payload's token packages for the tooltip. The dock row stays
      * compact; packages are detail-only.
      * @param {unknown} payload - Host payload.
@@ -153,12 +162,16 @@ window.__ModuleLoader__.load({
       if (packages.length === 0) return { details: [] };
       const details = [];
       for (const entry of packages) {
-        const remaining = typeof entry?.remaining === 'number' ? entry.remaining : 0;
+        const remaining = numberOr(entry?.remaining) ?? 0;
+        const grant = numberOr(entry?.grant);
+        const amount = grant !== undefined && grant > 0
+          ? `${formatTokens(remaining)} / ${formatTokens(grant)}`
+          : formatTokens(remaining);
         const model = typeof entry?.model === 'string' ? entry.model : '';
         const expiry = expiryText(entry?.expiresAt);
         details.push(
           [
-            `${entry?.name ?? t('packages')} ${formatTokens(remaining)}`,
+            `${entry?.name ?? t('packages')} ${amount}`,
             model.length > 0 ? model : '',
             expiry.length > 0 ? `${t('validUntil')} ${expiry}` : '',
           ]

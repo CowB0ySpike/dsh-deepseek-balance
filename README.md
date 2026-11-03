@@ -39,7 +39,7 @@ GLM        GLM 额度 5 小时 92% · 本周 79% ↻
 
 > GLM 的 Coding Plan 没有现金余额接口，只能查询额度，所以显示的是「5 小时 / 本周」的剩余百分比；标准 API Key 若账户有现金余额，则显示金额而不是百分比。
 >
-> 资源包（赠送的 token 包）来自 `/api/biz/tokenAccounts/list/my`，有包时在余额/额度后面追加「资源包 4.8M」，悬浮里列出每个包的剩余量、适用模型与有效期。
+> 资源包（赠送的 token / 次数包）来自 `/api/biz/tokenAccounts/list/my`，只在悬浮提示里列出：每个包显示「剩余 / 总量」（`tokenBalance` / `tokensMagnitude`）、适用模型与有效期；余额行保持简洁，不再追加资源包。
 >
 > 站点判定规则：两站都有金额时优先智谱中国站（¥）；智谱中国站为 0 或不可用、而 z.ai 有金额时用 z.ai（$）。可用 `region: cn` / `region: intl` 跳过探测。
 
@@ -136,7 +136,14 @@ GET /deepseek-balance?refresh=1                        # 强制刷新
   "balances": [{ "currency": "CNY", "total": "50.00", "granted": "0.00", "toppedUp": "50.00" }],
   "extras": { "spent": "8.75", "frozen": "0.00" },
   "packages": [
-    { "name": "GLM-5.3-Flash 资源包", "remaining": 2000000, "model": "glm-5.3-flash", "expiresAt": 1798809599000 }
+    {
+      "name": "【实名认证】500万GLM-5.3-Flash体验包",
+      "remaining": 1386447,
+      "grant": 5000000,
+      "consumeType": "TOKENS",
+      "model": "glm-5.3-flash",
+      "expiresAt": 1798809599000
+    }
   ],
   "fetchedAt": 1790000000000
 }
@@ -221,7 +228,7 @@ A DSH (DeepSeek Harness) plugin that shows the account balance — or plan quota
 - **DeepSeek**: cash balance via `GET https://api.deepseek.com/user/balance`.
 - **GLM / z.ai**: cash report (`/api/biz/account/query-customer-account-report`), falling back to the coding-plan quota (`/api/monitor/usage/quota/limit`) for subscription keys.
 - **Automatic station detection**: a `zai` key may belong to the 智谱 China site or to z.ai, so both are queried; a funded China account wins (CNY), otherwise the z.ai account is used (USD). `region: cn | intl` pins one.
-- **Token packages**: granted 资源包 (`/api/biz/tokenAccounts/list/my`) are appended to the row and detailed in the tooltip with remaining tokens, model, and expiry.
+- **Token packages**: granted 资源包 (`/api/biz/tokenAccounts/list/my`) are detailed in the tooltip as remaining/grant with model and expiry; the dock row stays compact.
 - The API key never leaves the Host process; the browser only reads the same-origin `/deepseek-balance` route.
 
 ### Install
