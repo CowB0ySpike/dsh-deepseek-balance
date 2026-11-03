@@ -1,11 +1,13 @@
 {
   "name": "dsh-deepseek-balance",
-  "version": "1.0.0",
-  "description": "DSH plugin: shows the DeepSeek API key account balance below the composer.",
+  "version": "1.1.0",
+  "description": "DSH plugin: shows the account balance (or plan quota) of the model provider the current session uses.",
   "keywords": [
     "dsh",
     "dsh-plugin",
     "deepseek",
+    "glm",
+    "zai",
     "balance",
     "usage"
   ],
@@ -20,6 +22,9 @@
   },
   "homepage": "https://github.com/CowB0ySpike/dsh-deepseek-balance#readme",
   "type": "module",
+  "scripts": {
+    "test": "node test/host.test.mjs"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",

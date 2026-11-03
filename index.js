@@ -1,21 +1,59 @@
 /**
  * Host half of `dsh-deepseek-balance`.
  *
- * Resolves the configured DeepSeek API key through the credentials service and
- * reads the account balance from `GET /user/balance`, then serves the result to
- * the browser half over one read-only same-origin route. The key never leaves
- * this process: the response carries balances and status only.
+ * Resolves the credential of the provider the current session actually routes
+ * to, reads that provider's account balance (or coding-plan quota) from its own
+ * read-only endpoint, and serves the normalized result to the browser half over
+ * one same-origin route. Keys never leave this process: the response carries
+ * balances, quota, and status only.
+ *
+ * Supported providers:
+ * - `deepseek` / `deepseek-official` — `GET /user/balance`
+ * - `zai` (z.ai) and `zai-coding-cn` (open.bigmodel.cn) — cash account report,
+ *   falling back to coding-plan quota limits
  *
  * @module dsh-deepseek-balance
  */
 
-const DEFAULT_API_KEY_ENV = 'DEEPSEEK_API_KEY';
-const DEFAULT_BASE_URL = 'https://api.deepseek.com';
+const DEFAULT_PROVIDER_ID = 'deepseek-official';
+const DEEPSEEK_BASE_URL = 'https://api.deepseek.com';
+const ZAI_HOST = 'https://api.z.ai';
+const BIGMODEL_HOST = 'https://open.bigmodel.cn';
+const CASH_PATH = '/api/biz/account/query-customer-account-report';
+const QUOTA_PATH = '/api/monitor/usage/quota/limit';
 const DEFAULT_CACHE_TTL_MS = 60_000;
 const DEFAULT_TIMEOUT_MS = 10_000;
 const ERROR_CACHE_TTL_MS = 5_000;
 const ROUTE_PATH = '/deepseek-balance';
-const USER_AGENT = 'dsh-deepseek-balance/1.0.0';
+const USER_AGENT = 'dsh-deepseek-balance/1.1.0';
+
+/**
+ * Known provider routes. `ref` is the credential reference DSH itself uses for
+ * that provider, so no extra configuration is needed when DSH is configured.
+ */
+const PROVIDERS = {
+	deepseek: {
+		kind: 'deepseek',
+		name: 'DeepSeek',
+		ref: 'DEEPSEEK_API_KEY',
+		host: DEEPSEEK_BASE_URL,
+		currency: 'CNY',
+	},
+	zai: {
+		kind: 'glm',
+		name: 'GLM',
+		ref: 'ZAI_API_KEY',
+		host: ZAI_HOST,
+		currency: 'USD',
+	},
+	'zai-coding-cn': {
+		kind: 'glm',
+		name: 'GLM',
+		ref: 'ZAI_CODING_CN_API_KEY',
+		host: BIGMODEL_HOST,
+		currency: 'CNY',
+	},
+};
 
 /** The credentials seam and the carrier that publishes the balance route. */
 export const inject = ['credentials', 'webServer'];
@@ -29,121 +67,96 @@ export const inject = ['credentials', 'webServer'];
 export function apply(ctx, config) {
 	const options = resolveOptions(config);
 
-	/** Cached payload plus the instant it stops being reusable. */
-	let cached;
-	/** Shared in-flight read so concurrent pages cost one upstream call. */
-	let inflight;
+	/** Cache per provider/model selection. */
+	const cache = new Map();
+	/** Shared in-flight reads so concurrent pages cost one upstream call. */
+	const inflight = new Map();
 
 	/**
-	 * Read the balance from the provider, mapping every failure to a status the
-	 * client can render.
+	 * Resolve the provider the session routes to.
 	 *
-	 * @returns the balance payload.
+	 * Precedence: explicit provider sent by the page, configured provider, DSH's
+	 * default model selection, then the historical DeepSeek route.
+	 *
+	 * @param requested - provider id sent by the browser half, if any.
+	 * @returns the provider id.
 	 */
-	async function readBalance() {
-		const ref = options.apiKeyEnv;
-		let info;
+	function currentProvider(requested) {
+		if (requested !== undefined) return requested;
+		if (options.provider !== undefined) return options.provider;
 		try {
-			info = await ctx.credentials.describe(ref);
-		} catch (error) {
-			return failure(ref, 'CREDENTIALS', describeError(error));
-		}
-		if (info === undefined || info.configured !== true) return { status: 'unconfigured', ref };
-
-		let resolved;
-		try {
-			resolved = await ctx.credentials.resolve(ref);
-		} catch (error) {
-			return failure(ref, 'CREDENTIALS', describeError(error));
-		}
-		if (resolved === undefined || typeof resolved.value !== 'string' || resolved.value.length === 0) {
-			return { status: 'unconfigured', ref };
-		}
-
-		const endpoint = `${options.baseURL}/user/balance`;
-		let response;
-		try {
-			response = await fetch(endpoint, {
-				method: 'GET',
-				redirect: 'error',
-				headers: {
-					authorization: `Bearer ${resolved.value}`,
-					accept: 'application/json',
-					'user-agent': USER_AGENT,
-				},
-				signal: AbortSignal.timeout(options.timeoutMs),
-			});
-		} catch (error) {
-			const timedOut = error !== null && typeof error === 'object' && error.name === 'TimeoutError';
-			return failure(ref, timedOut ? 'TIMEOUT' : 'NETWORK', describeError(error));
-		}
-
-		if (!response.ok) {
-			const detail = await readErrorDetail(response);
-			const unauthorized = response.status === 401 || response.status === 403;
-			return {
-				status: 'error',
-				ref,
-				code: unauthorized ? 'UNAUTHORIZED' : 'HTTP',
-				httpStatus: response.status,
-				message: detail ?? `HTTP ${response.status}`,
-			};
-		}
-
-		let body;
-		try {
-			body = await response.json();
+			const selection = ctx.get?.('agentDefaultModel')?.currentSelection?.();
+			const provider = selection?.provider;
+			if (typeof provider === 'string' && provider.length > 0) return provider;
 		} catch {
-			return failure(ref, 'RESPONSE', 'response body is not valid JSON');
+			// A deployment without the service keeps the fallback.
+		}
+		return DEFAULT_PROVIDER_ID;
+	}
+
+	/**
+	 * Read the balance (or quota) for one provider selection.
+	 *
+	 * @param selection - provider id plus the model id used for display.
+	 * @returns the normalized payload.
+	 */
+	async function readBalance(selection) {
+		const { provider, model } = selection;
+		const known = providerOf(provider);
+		if (known === undefined) return { status: 'unsupported', provider, model };
+
+		let key;
+		try {
+			const ref = options.apiKeyEnv ?? known.ref;
+			const info = await ctx.credentials.describe(ref);
+			if (info === undefined || info.configured !== true) {
+				return { status: 'unconfigured', provider, providerName: known.name, ref, model };
+			}
+			const resolved = await ctx.credentials.resolve(ref);
+			if (resolved === undefined || typeof resolved.value !== 'string' || resolved.value.length === 0) {
+				return { status: 'unconfigured', provider, providerName: known.name, ref, model };
+			}
+			key = resolved.value;
+		} catch (error) {
+			return failure(provider, known, 'CREDENTIALS', describeError(error), model);
 		}
 
-		const infos = Array.isArray(body?.balance_infos) ? body.balance_infos : [];
-		const balances = [];
-		for (const item of infos) {
-			const currency = text(item?.currency);
-			if (currency === undefined) continue;
-			balances.push({
-				currency,
-				total: text(item?.total_balance) ?? '',
-				granted: text(item?.granted_balance) ?? '',
-				toppedUp: text(item?.topped_up_balance) ?? '',
-			});
-		}
-		return {
-			status: 'ok',
-			ref,
-			isAvailable: body?.is_available !== false,
-			balances,
-			fetchedAt: Date.now(),
-		};
+		if (known.kind === 'deepseek') return readDeepSeek(known, key, options, provider, model);
+		return readGlm(known, key, options, provider, model);
 	}
 
 	/**
 	 * Serve one payload, reusing the cache unless a forced refresh is requested.
 	 *
+	 * @param selection - provider id plus model id.
 	 * @param force - bypass the cache (the refresh action).
 	 * @returns the payload the route returns.
 	 */
-	function getBalance(force) {
-		if (force !== true && cached !== undefined && Date.now() < cached.expiresAt) {
-			return Promise.resolve(cached.payload);
+	function getBalance(selection, force) {
+		const key = `${selection.provider}\u0000${selection.model ?? ''}`;
+		if (force !== true) {
+			const hit = cache.get(key);
+			if (hit !== undefined && Date.now() < hit.expiresAt) return Promise.resolve(hit.payload);
 		}
-		if (inflight !== undefined) return inflight;
-		inflight = readBalance().then(
+		const pending = inflight.get(key);
+		if (pending !== undefined) return pending;
+
+		const read = readBalance(selection).then(
 			(payload) => {
-				inflight = undefined;
+				inflight.delete(key);
 				const ttl = payload.status === 'ok' ? options.cacheTtlMs : ERROR_CACHE_TTL_MS;
-				cached = { payload, expiresAt: Date.now() + ttl };
+				cache.set(key, { payload, expiresAt: Date.now() + ttl });
 				return payload;
 			},
 			(error) => {
-				inflight = undefined;
-				const payload = failure(options.apiKeyEnv, 'INTERNAL', describeError(error));
-				cached = { payload, expiresAt: Date.now() + ERROR_CACHE_TTL_MS };
+				inflight.delete(key);
+				const payload = failure(selection.provider, providerOf(selection.provider), 'INTERNAL', describeError(error), selection.model);
+				cache.set(key, { payload, expiresAt: Date.now() + ERROR_CACHE_TTL_MS });
 				return payload;
 			},
 		);
-		return inflight;
+		inflight.set(key, read);
+		return read;
 	}
 
 	ctx.effect(() =>
@@ -158,26 +171,16 @@ export function apply(ctx, config) {
 						return;
 					}
 					const requested = new URL(req.url ?? '/', 'http://localhost');
-					const payload = await getBalance(requested.searchParams.get('refresh') === '1');
-					const json = JSON.stringify(payload);
-					res.writeHead(200, {
-						'content-type': 'application/json; charset=utf-8',
-						'cache-control': 'no-store',
-						'content-length': Buffer.byteLength(json),
-					});
-					res.end(json);
+					const provider = currentProvider(text(requested.searchParams.get('provider')));
+					const model = text(requested.searchParams.get('model'));
+					const payload = await getBalance({ provider, model }, requested.searchParams.get('refresh') === '1');
+					sendJson(res, 200, payload);
 				} catch (error) {
 					if (res.headersSent) {
 						res.end();
 						return;
 					}
-					const json = JSON.stringify(failure(options.apiKeyEnv, 'INTERNAL', describeError(error)));
-					res.writeHead(500, {
-						'content-type': 'application/json; charset=utf-8',
-						'cache-control': 'no-store',
-						'content-length': Buffer.byteLength(json),
-					});
-					res.end(json);
+					sendJson(res, 500, failure(options.provider ?? DEFAULT_PROVIDER_ID, undefined, 'INTERNAL', describeError(error), undefined));
 				}
 			},
 		}),
@@ -193,10 +196,11 @@ export function apply(ctx, config) {
  */
 function resolveOptions(config) {
 	const source = config !== null && typeof config === 'object' ? config : {};
-	const rawBaseUrl = text(source.baseURL) ?? DEFAULT_BASE_URL;
-	const baseURL = URL.canParse(rawBaseUrl) ? rawBaseUrl.replace(/\/+$/, '') : DEFAULT_BASE_URL;
+	const rawBaseUrl = text(source.baseURL);
+	const baseURL = rawBaseUrl !== undefined && URL.canParse(rawBaseUrl) ? rawBaseUrl.replace(/\/+$/, '') : undefined;
 	return {
-		apiKeyEnv: text(source.apiKeyEnv) ?? DEFAULT_API_KEY_ENV,
+		provider: text(source.provider),
+		apiKeyEnv: text(source.apiKeyEnv),
 		baseURL,
 		cacheTtlMs: positiveNumber(source.cacheTtlMs, DEFAULT_CACHE_TTL_MS),
 		timeoutMs: positiveNumber(source.timeoutMs, DEFAULT_TIMEOUT_MS),
@@ -204,38 +208,333 @@ function resolveOptions(config) {
 }
 
 /**
- * Build one error payload.
+ * Map a DSH provider route onto its balance endpoint.
  *
- * @param ref - credential reference name (never its value).
- * @param code - stable failure code for the client.
- * @param message - human-readable cause.
- * @returns the payload.
+ * @param provider - provider id such as `deepseek-official` or `zai`.
+ * @returns the provider descriptor, or undefined when unsupported.
  */
-function failure(ref, code, message) {
-	return { status: 'error', ref, code, message };
+function providerOf(provider) {
+	if (typeof provider !== 'string') return undefined;
+	if (Object.hasOwn(PROVIDERS, provider)) return PROVIDERS[provider];
+	const id = provider.toLowerCase();
+	if (id.includes('deepseek')) return PROVIDERS.deepseek;
+	if (id.includes('zai') || id.includes('glm') || id.includes('zhipu') || id.includes('bigmodel')) {
+		return id.includes('cn') ? PROVIDERS['zai-coding-cn'] : PROVIDERS.zai;
+	}
+	return undefined;
 }
 
 /**
- * Read the provider's error detail without trusting its shape.
+ * Read the DeepSeek account balance.
  *
- * @param response - a non-2xx provider response.
- * @returns the detail text, or undefined when none could be read.
+ * @param known - provider descriptor.
+ * @param key - resolved API key.
+ * @param options - resolved plugin options.
+ * @param provider - provider id to echo.
+ * @param model - model id to echo.
+ * @returns the normalized payload.
  */
-async function readErrorDetail(response) {
+async function readDeepSeek(known, key, options, provider, model) {
+	const baseURL = options.baseURL ?? known.host;
+	const result = await fetchJson(
+		`${baseURL}/user/balance`,
+		{ authorization: `Bearer ${key}`, accept: 'application/json', 'user-agent': USER_AGENT },
+		options.timeoutMs,
+	);
+	if (result.failure !== undefined) return failure(provider, known, result.failure.code, result.failure.message, model);
+	if (result.status === 401 || result.status === 403) {
+		return failure(provider, known, 'UNAUTHORIZED', detailOf(result.body) ?? `HTTP ${result.status}`, model);
+	}
+	if (result.status < 200 || result.status >= 300) {
+		return failure(provider, known, 'HTTP', detailOf(result.body) ?? `HTTP ${result.status}`, model);
+	}
+	if (result.body === undefined || typeof result.body !== 'object') {
+		return failure(provider, known, 'RESPONSE', 'response body is not valid JSON', model);
+	}
+
+	const infos = Array.isArray(result.body.balance_infos) ? result.body.balance_infos : [];
+	const balances = [];
+	for (const item of infos) {
+		const currency = text(item?.currency);
+		if (currency === undefined) continue;
+		balances.push({
+			currency,
+			total: text(item?.total_balance) ?? '',
+			granted: text(item?.granted_balance) ?? '',
+			toppedUp: text(item?.topped_up_balance) ?? '',
+		});
+	}
+	return {
+		status: 'ok',
+		provider,
+		providerName: known.name,
+		model,
+		kind: 'cash',
+		currency: balances[0]?.currency ?? known.currency,
+		isAvailable: result.body.is_available !== false,
+		balances,
+		fetchedAt: Date.now(),
+	};
+}
+
+/**
+ * Read a GLM cash balance, falling back to coding-plan quota when the account
+ * has no cash report (subscription keys).
+ *
+ * @param known - provider descriptor.
+ * @param key - resolved API key.
+ * @param options - resolved plugin options.
+ * @param provider - provider id to echo.
+ * @param model - model id to echo.
+ * @returns the normalized payload.
+ */
+async function readGlm(known, key, options, provider, model) {
+	const host = options.baseURL ?? known.host;
+	const cash = await readGlmCash(known, key, host, options.timeoutMs, provider, model);
+	if (cash.payload !== undefined) return cash.payload;
+
+	const quota = await readGlmQuota(known, key, host, options.timeoutMs, provider, model);
+	if (quota.payload !== undefined) return quota.payload;
+
+	return quota.error ?? cash.error;
+}
+
+/**
+ * Read the cash account report.
+ *
+ * @param known - provider descriptor.
+ * @param key - resolved API key.
+ * @param host - provider host.
+ * @param timeoutMs - per-request timeout.
+ * @param provider - provider id to echo.
+ * @param model - model id to echo.
+ * @returns a payload or an error.
+ */
+async function readGlmCash(known, key, host, timeoutMs, provider, model) {
+	const result = await fetchJson(
+		`${host}${CASH_PATH}`,
+		{ authorization: `Bearer ${key}`, accept: 'application/json', 'user-agent': USER_AGENT },
+		timeoutMs,
+	);
+	if (result.failure !== undefined) {
+		return { error: failure(provider, known, result.failure.code, result.failure.message, model) };
+	}
+	if (result.status === 401 || result.status === 403) {
+		return { error: failure(provider, known, 'UNAUTHORIZED', detailOf(result.body) ?? `HTTP ${result.status}`, model) };
+	}
+	const envelope = businessFailure(result.body);
+	if (envelope !== undefined) {
+		return { error: failure(provider, known, envelope.unauthorized ? 'UNAUTHORIZED' : 'HTTP', envelope.message, model) };
+	}
+
+	const data = result.body?.data !== null && typeof result.body?.data === 'object' ? result.body.data : undefined;
+	const total = numberOf(data?.availableBalance) ?? numberOf(data?.balance);
+	const granted = numberOf(data?.giveAmount);
+	const toppedUp = numberOf(data?.rechargeAmount);
+	const spent = numberOf(data?.totalSpendAmount);
+	const frozen = numberOf(data?.frozenBalance);
+	if (total === undefined && granted === undefined && toppedUp === undefined) {
+		return { error: failure(provider, known, 'RESPONSE', 'cash report carries no amounts', model) };
+	}
+	return {
+		payload: {
+			status: 'ok',
+			provider,
+			providerName: known.name,
+			model,
+			kind: 'cash',
+			currency: known.currency,
+			isAvailable: total === undefined ? true : total > 0,
+			balances: [
+				{
+					currency: known.currency,
+					total: formatAmount(total),
+					granted: formatAmount(granted),
+					toppedUp: formatAmount(toppedUp),
+				},
+			],
+			extras: { spent: formatAmount(spent), frozen: formatAmount(frozen) },
+			fetchedAt: Date.now(),
+		},
+	};
+}
+
+/**
+ * Read coding-plan quota limits.
+ *
+ * The China monitor endpoint authenticates with the raw key, z.ai with a bearer
+ * token — the same split the plan's own clients use.
+ *
+ * @param known - provider descriptor.
+ * @param key - resolved API key.
+ * @param host - provider host.
+ * @param timeoutMs - per-request timeout.
+ * @param provider - provider id to echo.
+ * @param model - model id to echo.
+ * @returns a payload or an error.
+ */
+async function readGlmQuota(known, key, host, timeoutMs, provider, model) {
+	const result = await fetchJson(
+		`${host}${QUOTA_PATH}`,
+		{
+			authorization: known.host === BIGMODEL_HOST ? key : `Bearer ${key}`,
+			accept: 'application/json',
+			'user-agent': USER_AGENT,
+		},
+		timeoutMs,
+	);
+	if (result.failure !== undefined) {
+		return { error: failure(provider, known, result.failure.code, result.failure.message, model) };
+	}
+	if (result.status === 401 || result.status === 403) {
+		return { error: failure(provider, known, 'UNAUTHORIZED', detailOf(result.body) ?? `HTTP ${result.status}`, model) };
+	}
+	const envelope = businessFailure(result.body);
+	if (envelope !== undefined) {
+		return { error: failure(provider, known, envelope.unauthorized ? 'UNAUTHORIZED' : 'HTTP', envelope.message, model) };
+	}
+
+	const quota = parseQuota(result.body);
+	if (quota.length === 0) {
+		return { error: failure(provider, known, 'RESPONSE', 'this account exposes neither a cash balance nor a coding-plan quota', model) };
+	}
+	return {
+		payload: {
+			status: 'ok',
+			provider,
+			providerName: known.name,
+			model,
+			kind: 'quota',
+			currency: known.currency,
+			quota,
+			fetchedAt: Date.now(),
+		},
+	};
+}
+
+/**
+ * Extract remaining percentages from a coding-plan quota response.
+ *
+ * @param body - parsed quota response.
+ * @returns quota entries, possibly empty.
+ */
+function parseQuota(body) {
+	const container = body?.data ?? body;
+	const limits = Array.isArray(container) ? container : Array.isArray(container?.limits) ? container.limits : [];
+	const quota = [];
+	for (const item of limits) {
+		if (item === null || typeof item !== 'object') continue;
+		const kind = text(item.type) ?? text(item.name);
+		if (kind === undefined) continue;
+		const percentage = numberOf(item.percentage);
+		if (kind === 'TIME_LIMIT') {
+			const used = numberOrZero(item.currentValue);
+			const limit = numberOrZero(item.usage);
+			const remaining = limit > 0 ? clamp(100 - (used / limit) * 100, 0, 100) : 100;
+			quota.push({ id: 'web', remaining, resetsAt: numberOf(item.nextResetTime) });
+			continue;
+		}
+		if (percentage === undefined) continue;
+		const id = item.unit === 3 ? '5h' : item.unit === 6 ? 'week' : undefined;
+		if (id === undefined) continue;
+		quota.push({ id, remaining: clamp(100 - percentage, 0, 100), resetsAt: numberOf(item.nextResetTime) });
+	}
+	const seen = new Set();
+	return quota.filter((entry) => {
+		if (seen.has(entry.id)) return false;
+		seen.add(entry.id);
+		return true;
+	});
+}
+
+/**
+ * GET a JSON endpoint, mapping transport failures to stable codes.
+ *
+ * @param url - absolute endpoint.
+ * @param headers - request headers.
+ * @param timeoutMs - per-request timeout.
+ * @returns parsed response or a failure.
+ */
+async function fetchJson(url, headers, timeoutMs) {
+	let response;
+	try {
+		response = await fetch(url, { method: 'GET', redirect: 'error', headers, signal: AbortSignal.timeout(timeoutMs) });
+	} catch (error) {
+		const timedOut = error !== null && typeof error === 'object' && error.name === 'TimeoutError';
+		return { failure: { code: timedOut ? 'TIMEOUT' : 'NETWORK', message: describeError(error) } };
+	}
+	let body;
 	try {
 		const raw = await response.text();
-		if (typeof raw !== 'string' || raw.length === 0) return undefined;
-		try {
-			const parsed = JSON.parse(raw);
-			const detail = typeof parsed?.error === 'string' ? parsed.error : parsed?.error?.message ?? parsed?.message;
-			if (typeof detail === 'string' && detail.length > 0) return detail.slice(0, 512);
-		} catch {
-			// Not JSON: fall through to the raw body.
-		}
-		return raw.slice(0, 512);
+		body = raw.length > 0 ? JSON.parse(raw) : undefined;
 	} catch {
-		return undefined;
+		body = undefined;
 	}
+	return { status: response.status, body };
+}
+
+/**
+ * Report the provider's own failure message when its envelope says it failed.
+ *
+ * @param body - parsed provider response.
+ * @returns the failure, or undefined for a successful envelope.
+ */
+function businessFailure(body) {
+	if (body === undefined || body === null || typeof body !== 'object') {
+		return { unauthorized: false, message: 'response body is not valid JSON' };
+	}
+	if (body.success === true) return undefined;
+	if (body.code === 200 || body.code === '200') return undefined;
+	if (body.success === false || typeof body.code === 'number') {
+		const unauthorized = body.code === 401 || body.code === 403;
+		return { unauthorized, message: detailOf(body) ?? `provider code ${body.code}` };
+	}
+	return undefined;
+}
+
+/**
+ * Read the provider's human-readable detail without trusting its shape.
+ *
+ * @param body - parsed provider response.
+ * @returns the detail text, or undefined.
+ */
+function detailOf(body) {
+	if (body === undefined || body === null || typeof body !== 'object') return undefined;
+	const candidate = body.msg ?? body.message ?? body.error?.message ?? (typeof body.error === 'string' ? body.error : undefined);
+	if (typeof candidate !== 'string') return undefined;
+	const trimmed = candidate.trim();
+	return trimmed.length > 0 ? trimmed.slice(0, 512) : undefined;
+}
+
+/**
+ * Build one error payload.
+ *
+ * @param provider - provider id.
+ * @param known - provider descriptor, when known.
+ * @param code - stable failure code for the client.
+ * @param message - human-readable cause.
+ * @param model - model id, when known.
+ * @returns the payload.
+ */
+function failure(provider, known, code, message, model) {
+	return { status: 'error', provider, providerName: known?.name, model, code, message };
+}
+
+/**
+ * Write one JSON response.
+ *
+ * @param res - response object.
+ * @param status - HTTP status.
+ * @param payload - JSON-serializable payload.
+ */
+function sendJson(res, status, payload) {
+	const json = JSON.stringify(payload);
+	res.writeHead(status, {
+		'content-type': 'application/json; charset=utf-8',
+		'cache-control': 'no-store',
+		'content-length': Buffer.byteLength(json),
+	});
+	res.end(json);
 }
 
 /**
@@ -247,6 +546,54 @@ async function readErrorDetail(response) {
 function describeError(error) {
 	if (error instanceof Error) return error.message;
 	return String(error);
+}
+
+/**
+ * Coerce a provider amount to a number.
+ *
+ * @param value - number or numeric string.
+ * @returns the number, or undefined.
+ */
+function numberOf(value) {
+	if (typeof value === 'number' && Number.isFinite(value)) return value;
+	if (typeof value === 'string' && value.trim() !== '') {
+		const parsed = Number(value);
+		if (Number.isFinite(parsed)) return parsed;
+	}
+	return undefined;
+}
+
+/**
+ * Format an amount for display, keeping two decimals.
+ *
+ * @param value - the amount.
+ * @returns the formatted amount, or an empty string.
+ */
+function formatAmount(value) {
+	if (value === undefined) return '';
+	return value.toFixed(2);
+}
+
+/**
+ * Coerce to a finite number, defaulting to zero.
+ *
+ * @param value - the candidate.
+ * @returns the number.
+ */
+function numberOrZero(value) {
+	return numberOf(value) ?? 0;
+}
+
+/**
+ * Clamp a number into a range.
+ *
+ * @param value - the value to clamp.
+ * @param min - lower bound.
+ * @param max - upper bound.
+ * @returns the clamped value.
+ */
+function clamp(value, min, max) {
+	return Math.min(max, Math.max(min, value));
 }
 
 /**
