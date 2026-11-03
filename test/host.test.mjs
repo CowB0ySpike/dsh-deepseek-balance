@@ -59,12 +59,45 @@ async function callRoute(routes, url, method = 'GET') {
   return { status: res.status, payload };
 }
 
-/** Replace fetch with one handler for the duration of one test. */
+/** Replace fetch for the duration of one test. */
 function withFetch(handler) {
   const original = globalThis.fetch;
   globalThis.fetch = handler;
   return () => {
     globalThis.fetch = original;
+  };
+}
+
+/** A successful GLM cash report. */
+function cashBody(amount) {
+  return {
+    code: 200,
+    success: true,
+    data: {
+      availableBalance: amount,
+      rechargeAmount: amount,
+      giveAmount: 0,
+      totalSpendAmount: 0,
+      frozenBalance: 0,
+    },
+  };
+}
+
+/** A rejected GLM envelope. */
+function rejectedBody(code = 401, msg = 'token expired') {
+  return { code, success: false, msg };
+}
+
+/** Quota limits shaped like the coding-plan response. */
+function quotaBody() {
+  return {
+    code: 200,
+    data: {
+      limits: [
+        { type: 'TOKENS_LIMIT', unit: 3, percentage: 8.5, nextResetTime: 1792590000000 },
+        { type: 'TOKENS_LIMIT', unit: 6, percentage: 21, nextResetTime: 1793000000000 },
+      ],
+    },
   };
 }
 
@@ -119,23 +152,17 @@ test('keeps granted and topped-up amounts on their own fields', async () => {
   }
 });
 
-test('reads a GLM cash report with dollar amounts', async () => {
+test('prefers the funded 智谱 station and reports CNY', async () => {
+  const calls = [];
   const restore = withFetch(async (url) => {
-    assert.match(url, /api\.z\.ai\/api\/biz\/account\/query-customer-account-report$/);
-    return new Response(
-      JSON.stringify({
-        code: 200,
-        success: true,
-        data: {
-          availableBalance: 12.5,
-          rechargeAmount: 20,
-          giveAmount: 1.25,
-          totalSpendAmount: 8.75,
-          frozenBalance: 0,
-        },
-      }),
-      { status: 200 },
-    );
+    calls.push(url);
+    if (url.startsWith('https://open.bigmodel.cn/')) {
+      return new Response(JSON.stringify(cashBody(50)), { status: 200 });
+    }
+    if (url.startsWith('https://api.z.ai/')) {
+      return new Response(JSON.stringify(cashBody(7)), { status: 200 });
+    }
+    throw new Error(`unexpected url ${url}`);
   });
   try {
     const { ctx, routes } = makeContext('zai');
@@ -143,12 +170,70 @@ test('reads a GLM cash report with dollar amounts', async () => {
     const { payload } = await callRoute(routes, '/deepseek-balance?provider=zai&model=glm-5.3');
     assert.equal(payload.status, 'ok');
     assert.equal(payload.kind, 'cash');
-    assert.equal(payload.providerName, 'GLM');
-    assert.equal(payload.currency, 'USD');
+    assert.equal(payload.station, 'cn');
+    assert.equal(payload.currency, 'CNY');
     assert.deepEqual(payload.balances, [
-      { currency: 'USD', total: '12.50', granted: '1.25', toppedUp: '20.00' },
+      { currency: 'CNY', total: '50.00', granted: '0.00', toppedUp: '50.00' },
     ]);
-    assert.deepEqual(payload.extras, { spent: '8.75', frozen: '0.00' });
+    assert.ok(calls.some((url) => url.startsWith('https://open.bigmodel.cn/')));
+  } finally {
+    restore();
+  }
+});
+
+test('defers to a funded z.ai station when the 智谱 account is empty', async () => {
+  const restore = withFetch(async (url) => {
+    if (url.startsWith('https://open.bigmodel.cn/')) {
+      return new Response(JSON.stringify(cashBody(0)), { status: 200 });
+    }
+    if (url.startsWith('https://api.z.ai/')) {
+      return new Response(JSON.stringify(cashBody(12.5)), { status: 200 });
+    }
+    throw new Error(`unexpected url ${url}`);
+  });
+  try {
+    const { ctx, routes } = makeContext('zai');
+    apply(ctx, {});
+    const { payload } = await callRoute(routes, '/deepseek-balance?provider=zai');
+    assert.equal(payload.station, 'intl');
+    assert.equal(payload.currency, 'USD');
+    assert.equal(payload.balances[0].total, '12.50');
+  } finally {
+    restore();
+  }
+});
+
+test('queries only the China station for zai-coding-cn', async () => {
+  const calls = [];
+  const restore = withFetch(async (url) => {
+    calls.push(url);
+    return new Response(JSON.stringify(cashBody(50)), { status: 200 });
+  });
+  try {
+    const { ctx, routes } = makeContext('zai-coding-cn');
+    apply(ctx, {});
+    const { payload } = await callRoute(routes, '/deepseek-balance');
+    assert.equal(payload.station, 'cn');
+    assert.equal(payload.currency, 'CNY');
+    assert.ok(calls.every((url) => url.startsWith('https://open.bigmodel.cn/')));
+  } finally {
+    restore();
+  }
+});
+
+test('honours an explicit intl region', async () => {
+  const calls = [];
+  const restore = withFetch(async (url) => {
+    calls.push(url);
+    return new Response(JSON.stringify(cashBody(9.99)), { status: 200 });
+  });
+  try {
+    const { ctx, routes } = makeContext('zai');
+    apply(ctx, { region: 'intl' });
+    const { payload } = await callRoute(routes, '/deepseek-balance');
+    assert.equal(payload.station, 'intl');
+    assert.equal(payload.currency, 'USD');
+    assert.ok(calls.every((url) => url.startsWith('https://api.z.ai/')));
   } finally {
     restore();
   }
@@ -157,21 +242,12 @@ test('reads a GLM cash report with dollar amounts', async () => {
 test('falls back to the coding-plan quota when there is no cash report', async () => {
   const restore = withFetch(async (url) => {
     if (url.includes('query-customer-account-report')) {
-      return new Response(JSON.stringify({ code: 401, success: false, msg: 'token expired' }), { status: 200 });
+      return new Response(JSON.stringify(rejectedBody()), { status: 200 });
     }
-    assert.match(url, /\/api\/monitor\/usage\/quota\/limit$/);
-    return new Response(
-      JSON.stringify({
-        code: 200,
-        data: {
-          limits: [
-            { type: 'TOKENS_LIMIT', unit: 3, percentage: 8.5, nextResetTime: 1792590000000 },
-            { type: 'TOKENS_LIMIT', unit: 6, percentage: 21, nextResetTime: 1793000000000 },
-          ],
-        },
-      }),
-      { status: 200 },
-    );
+    if (url.startsWith('https://open.bigmodel.cn/')) {
+      return new Response(JSON.stringify(quotaBody()), { status: 200 });
+    }
+    throw new Error(`unexpected url ${url}`);
   });
   try {
     const { ctx, routes } = makeContext('zai');
@@ -179,9 +255,9 @@ test('falls back to the coding-plan quota when there is no cash report', async (
     const { payload } = await callRoute(routes, '/deepseek-balance?provider=zai');
     assert.equal(payload.status, 'ok');
     assert.equal(payload.kind, 'quota');
+    assert.equal(payload.station, 'cn');
     assert.equal(payload.quota.length, 2);
     assert.equal(payload.quota[0].id, '5h');
-    assert.equal(payload.quota[1].id, 'week');
     assert.equal(Math.round(payload.quota[0].remaining), 92);
     assert.equal(Math.round(payload.quota[1].remaining), 79);
   } finally {

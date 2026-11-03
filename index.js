@@ -25,7 +25,7 @@ const DEFAULT_CACHE_TTL_MS = 60_000;
 const DEFAULT_TIMEOUT_MS = 10_000;
 const ERROR_CACHE_TTL_MS = 5_000;
 const ROUTE_PATH = '/deepseek-balance';
-const USER_AGENT = 'dsh-deepseek-balance/1.1.0';
+const USER_AGENT = 'dsh-deepseek-balance/1.2.0';
 
 /**
  * Known provider routes. `ref` is the credential reference DSH itself uses for
@@ -198,10 +198,12 @@ function resolveOptions(config) {
 	const source = config !== null && typeof config === 'object' ? config : {};
 	const rawBaseUrl = text(source.baseURL);
 	const baseURL = rawBaseUrl !== undefined && URL.canParse(rawBaseUrl) ? rawBaseUrl.replace(/\/+$/, '') : undefined;
+	const region = text(source.region);
 	return {
 		provider: text(source.provider),
 		apiKeyEnv: text(source.apiKeyEnv),
 		baseURL,
+		region: region === 'cn' || region === 'intl' ? region : undefined,
 		cacheTtlMs: positiveNumber(source.cacheTtlMs, DEFAULT_CACHE_TTL_MS),
 		timeoutMs: positiveNumber(source.timeoutMs, DEFAULT_TIMEOUT_MS),
 	};
@@ -277,6 +279,33 @@ async function readDeepSeek(known, key, options, provider, model) {
 	};
 }
 
+/** China station: the 智谱 open platform, amounts in CNY. */
+const CN_STATION = { station: 'cn', host: BIGMODEL_HOST, currency: 'CNY' };
+/** International station: z.ai, amounts in USD. */
+const INTL_STATION = { station: 'intl', host: ZAI_HOST, currency: 'USD' };
+
+/**
+ * Candidate stations for a GLM route, in preference order.
+ *
+ * `auto` asks both stations for a `zai` route because one key can belong to
+ * either account; a funded China answer wins, and a zero China answer defers
+ * to a funded z.ai answer.
+ *
+ * @param known - provider descriptor.
+ * @param options - resolved options.
+ * @returns stations to query.
+ */
+function glmStations(known, options) {
+	if (options.baseURL !== undefined) {
+		const cn = options.baseURL.includes('bigmodel');
+		return [{ station: cn ? 'cn' : 'intl', host: options.baseURL, currency: cn ? 'CNY' : 'USD' }];
+	}
+	if (options.region === 'cn') return [CN_STATION];
+	if (options.region === 'intl') return [INTL_STATION];
+	if (known.host === BIGMODEL_HOST) return [CN_STATION];
+	return [CN_STATION, INTL_STATION];
+}
+
 /**
  * Read a GLM cash balance, falling back to coding-plan quota when the account
  * has no cash report (subscription keys).
@@ -289,14 +318,48 @@ async function readDeepSeek(known, key, options, provider, model) {
  * @returns the normalized payload.
  */
 async function readGlm(known, key, options, provider, model) {
-	const host = options.baseURL ?? known.host;
-	const cash = await readGlmCash(known, key, host, options.timeoutMs, provider, model);
-	if (cash.payload !== undefined) return cash.payload;
+	const stations = glmStations(known, options);
+	const cash = await Promise.all(
+		stations.map((station) => readGlmCash(known, key, station, options.timeoutMs, provider, model)),
+	);
+	const picked = pickCash(cash);
+	if (picked !== undefined) return picked;
 
-	const quota = await readGlmQuota(known, key, host, options.timeoutMs, provider, model);
-	if (quota.payload !== undefined) return quota.payload;
+	const quota = await Promise.all(
+		stations.map((station) => readGlmQuota(known, key, station, options.timeoutMs, provider, model)),
+	);
+	const quotaResult = quota.find((result) => result.payload !== undefined);
+	if (quotaResult !== undefined) return quotaResult.payload;
 
-	return quota.error ?? cash.error;
+	const preferred = Math.max(
+		0,
+		stations.findIndex((station) => station.host === known.host),
+	);
+	return (quota[preferred] ?? quota[0])?.error ?? (cash[preferred] ?? cash[0])?.error;
+}
+
+/**
+ * Choose the cash payload to display.
+ *
+ * @param results - per-station cash results.
+ * @returns the payload, or undefined.
+ */
+function pickCash(results) {
+	const payloads = results.map((result) => result.payload).filter((payload) => payload !== undefined);
+	if (payloads.length === 0) return undefined;
+	return payloads.find(isFunded) ?? payloads[0];
+}
+
+/**
+ * Whether a cash payload reports any money.
+ *
+ * @param payload - cash payload.
+ * @returns true when a balance, spend, or freeze is non-zero.
+ */
+function isFunded(payload) {
+	const amounts = payload.balances.flatMap((balance) => [balance.total, balance.granted, balance.toppedUp]);
+	amounts.push(payload.extras.spent, payload.extras.frozen);
+	return amounts.some((value) => numberOrZero(value) > 0);
 }
 
 /**
@@ -304,15 +367,15 @@ async function readGlm(known, key, options, provider, model) {
  *
  * @param known - provider descriptor.
  * @param key - resolved API key.
- * @param host - provider host.
+ * @param station - station descriptor carrying host and currency.
  * @param timeoutMs - per-request timeout.
  * @param provider - provider id to echo.
  * @param model - model id to echo.
  * @returns a payload or an error.
  */
-async function readGlmCash(known, key, host, timeoutMs, provider, model) {
+async function readGlmCash(known, key, station, timeoutMs, provider, model) {
 	const result = await fetchJson(
-		`${host}${CASH_PATH}`,
+		`${station.host}${CASH_PATH}`,
 		{ authorization: `Bearer ${key}`, accept: 'application/json', 'user-agent': USER_AGENT },
 		timeoutMs,
 	);
@@ -342,12 +405,13 @@ async function readGlmCash(known, key, host, timeoutMs, provider, model) {
 			provider,
 			providerName: known.name,
 			model,
+			station: station.station,
 			kind: 'cash',
-			currency: known.currency,
+			currency: station.currency,
 			isAvailable: total === undefined ? true : total > 0,
 			balances: [
 				{
-					currency: known.currency,
+					currency: station.currency,
 					total: formatAmount(total),
 					granted: formatAmount(granted),
 					toppedUp: formatAmount(toppedUp),
@@ -367,17 +431,17 @@ async function readGlmCash(known, key, host, timeoutMs, provider, model) {
  *
  * @param known - provider descriptor.
  * @param key - resolved API key.
- * @param host - provider host.
+ * @param station - station descriptor carrying host and currency.
  * @param timeoutMs - per-request timeout.
  * @param provider - provider id to echo.
  * @param model - model id to echo.
  * @returns a payload or an error.
  */
-async function readGlmQuota(known, key, host, timeoutMs, provider, model) {
+async function readGlmQuota(known, key, station, timeoutMs, provider, model) {
 	const result = await fetchJson(
-		`${host}${QUOTA_PATH}`,
+		`${station.host}${QUOTA_PATH}`,
 		{
-			authorization: known.host === BIGMODEL_HOST ? key : `Bearer ${key}`,
+			authorization: station.host === BIGMODEL_HOST ? key : `Bearer ${key}`,
 			accept: 'application/json',
 			'user-agent': USER_AGENT,
 		},
@@ -404,8 +468,9 @@ async function readGlmQuota(known, key, host, timeoutMs, provider, model) {
 			provider,
 			providerName: known.name,
 			model,
+			station: station.station,
 			kind: 'quota',
-			currency: known.currency,
+			currency: station.currency,
 			quota,
 			fetchedAt: Date.now(),
 		},

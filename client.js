@@ -104,8 +104,10 @@ window.__ModuleLoader__.load({
     function selectionLine(payload, t) {
       const provider = payload.providerName ?? payload.provider ?? '';
       const model = typeof payload.model === 'string' ? payload.model : '';
+      const station = payload.station === 'cn' ? '智谱中国' : payload.station === 'intl' ? 'z.ai' : '';
       if (provider.length === 0 && model.length === 0) return '';
-      return `${t('model')}: ${model.length > 0 ? `${provider} / ${model}` : provider}`;
+      const route = model.length > 0 ? `${provider} / ${model}` : provider;
+      return `${t('model')}: ${route}${station.length > 0 ? ` · ${station}` : ''}`;
     }
 
     /**
