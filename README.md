@@ -174,6 +174,7 @@ GET /deepseek-balance?refresh=1                        # 强制刷新
 
 其它状态：
 
+- `{ "status": "unidentified", "model": "glm-5.3" }`（无法识别当前模型供应商）
 - `{ "status": "unsupported", "provider": "openai", "model": "gpt-5.6" }`
 - `{ "status": "signed-out", "provider": "deepseek-account", "providerName": "DeepSeek" }`（账号未登录）
 - `{ "status": "unconfigured", "provider": "zai", "providerName": "GLM", "ref": "ZAI_API_KEY" }`
@@ -192,14 +193,14 @@ GET /deepseek-balance?refresh=1                        # 强制刷新
 | `locale/*.json` | 插件在设置页/市场里的中英文名称与简介 |
 | `icon.svg` | 插件图标 |
 
-### 判定逻辑（精确优先）
+### 判定逻辑（精确优先，无猜测兜底）
 
 1. **当前模型**：客户端通过 slot 的 `inject(sessionId)` 拿到 DSH 的 `modelDirectories.directoryFor(sessionId).store`——这正是输入框模型控件渲染的同一份数据；用 `useSyncExternalStore` 订阅，切换模型立即重查。目录服务不可用时才退回读取标签上的 `data-provider-id` / `data-model-id`。
 2. **余额来源**：Host 用 `ctx.llm.listConfigurableProviders()` 查该 provider 的目录条目，按**事实**判定：
-   - `nativeAuth.env` → 该路由实际使用的凭据引用（不再写死 `ZAI_API_KEY` 等）
+   - `nativeAuth.env` → 该路由实际使用的凭据引用（自定义 `apiKeyEnv` 也能对上）
    - `baseURL` / `defaultBaseURL` 的域名 → `api.deepseek.com` 现金余额、`open.bigmodel.cn` 智谱中国站、`api.z.ai` z.ai
-3. **首方路由**：不发布目录条目的 `deepseek-official` / `deepseek`，以及账号路由 `deepseek-account`，用显式表判定；后者走 `deepseekAccount` 服务读 Platform 钱包。
-4. **兜底**：仍无法判定时才用 provider id 子串（含 `zai` / `glm` / `bigmodel` 等），最后回退 `deepseek-official`。
+3. **精确 id 表**：只对不发布目录事实的首方路由做**精确匹配**（`deepseek-official`、`deepseek`、`zai`、`zai-coding-cn`、`deepseek-account`），端点事实优先于该表。
+4. **识别不出来就提示**：没有页面选择、也没有配置 `provider` 时返回 `unidentified`，余额行显示「无法识别当前模型」；路由存在但无法归类时显示「当前模型不支持余额查询」。**不做 id 子串猜测，也不会默认成 DeepSeek。**
 
 其余规则：
 
@@ -246,6 +247,7 @@ A DSH (DeepSeek Harness) plugin that shows the account balance — or plan quota
 - **Automatic station detection**: a `zai` key may belong to the 智谱 China site or to z.ai, so both are queried; a funded China account wins (CNY), otherwise the z.ai account is used (USD). `region: cn | intl` pins one.
 - **Token packages**: granted 资源包 (`/api/biz/tokenAccounts/list/my`) are detailed in the tooltip as remaining/grant with model and expiry; the dock row stays compact.
 - **Account route**: `deepseek-account` reads the signed-in account's wallets through DSH's `deepseekAccount` service instead of the API-key endpoint; `deepseek-official` / `deepseek` keep using `GET /user/balance`.
+- **No guessing**: routes without directory facts match an exact id table only; when nothing names the provider the bar shows `Cannot identify the current model` instead of defaulting to DeepSeek.
 - The API key never leaves the Host process; the browser only reads the same-origin `/deepseek-balance` route.
 
 ### Install

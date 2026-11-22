@@ -17,6 +17,7 @@ window.__ModuleLoader__.load({
         refresh: '刷新余额',
         unconfigured: '未配置 API Key',
         signedOut: '账号未登录',
+        unidentified: '无法识别当前模型',
         account: '账号',
         accountSuffix: ' 账号',
         unauthorized: 'API Key 无效',
@@ -44,6 +45,7 @@ window.__ModuleLoader__.load({
         refresh: 'Refresh balance',
         unconfigured: 'No API key configured',
         signedOut: 'Account not signed in',
+        unidentified: 'Cannot identify the current model',
         account: 'Account',
         accountSuffix: ' account',
         unauthorized: 'API key is invalid',
@@ -203,6 +205,7 @@ window.__ModuleLoader__.load({
       if (payload === null || typeof payload !== 'object') return { kind: 'error', message: t('failed') };
       if (payload.status === 'unconfigured') return { kind: 'unconfigured', provider: payload.providerName };
       if (payload.status === 'signed-out') return { kind: 'signed-out', provider: payload.providerName };
+      if (payload.status === 'unidentified') return { kind: 'unidentified' };
       if (payload.status === 'unsupported') {
         return { kind: 'unsupported', provider: payload.providerName ?? payload.provider };
       }
@@ -432,6 +435,8 @@ window.__ModuleLoader__.load({
         } else if (view.kind === 'signed-out') {
           text = `${t('label')} · ${t('signedOut')}`;
           title = view.provider === undefined ? undefined : `${t('model')}: ${view.provider}${t('accountSuffix')}`;
+        } else if (view.kind === 'unidentified') {
+          text = `${t('label')} · ${t('unidentified')}`;
         } else if (view.kind === 'error') {
           text = `${t('label')} · ${view.message}`;
           color = 'var(--dsw-alias-state-error-primary)';

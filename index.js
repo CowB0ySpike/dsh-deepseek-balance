@@ -19,7 +19,6 @@
 
 import { readFileSync } from 'node:fs';
 
-const DEFAULT_PROVIDER_ID = 'deepseek-official';
 const DEEPSEEK_BASE_URL = 'https://api.deepseek.com';
 const ZAI_HOST = 'https://api.z.ai';
 const BIGMODEL_HOST = 'https://open.bigmodel.cn';
@@ -33,13 +32,21 @@ const ROUTE_PATH = '/deepseek-balance';
 const USER_AGENT = 'dsh-deepseek-balance/1.5.0';
 
 /**
- * Known provider routes. `ref` is the credential reference DSH itself uses for
- * that provider, so no extra configuration is needed when DSH is configured.
+ * Exact first-party routes that publish no configurable-provider facts. Lookup
+ * is by exact id only — never by substring — and endpoint facts still win when
+ * a route is also present in the provider directory.
  */
-const PROVIDERS = {
+const FIRST_PARTY_ROUTES = {
 	'deepseek-account': {
 		kind: 'account',
 		name: 'DeepSeek',
+	},
+	'deepseek-official': {
+		kind: 'deepseek',
+		name: 'DeepSeek',
+		ref: 'DEEPSEEK_API_KEY',
+		host: DEEPSEEK_BASE_URL,
+		currency: 'CNY',
 	},
 	deepseek: {
 		kind: 'deepseek',
@@ -93,14 +100,7 @@ export function apply(ctx, config) {
 	function currentProvider(requested) {
 		if (requested !== undefined) return requested;
 		if (options.provider !== undefined) return options.provider;
-		try {
-			const selection = ctx.get?.('agentDefaultModel')?.currentSelection?.();
-			const provider = selection?.provider;
-			if (typeof provider === 'string' && provider.length > 0) return provider;
-		} catch {
-			// A deployment without the service keeps the fallback.
-		}
-		return DEFAULT_PROVIDER_ID;
+		return undefined;
 	}
 
 	/**
@@ -111,6 +111,7 @@ export function apply(ctx, config) {
 	 */
 	async function readBalance(selection) {
 		const { provider, model } = selection;
+		if (provider === undefined) return { status: 'unidentified', model };
 		const known = resolveDescriptor(ctx, provider, options);
 		if (known === undefined) return { status: 'unsupported', provider, model };
 		if (known.kind === 'account') return readAccountBalance(ctx, known, provider, model);
@@ -160,7 +161,7 @@ export function apply(ctx, config) {
 			},
 			(error) => {
 				inflight.delete(key);
-				const payload = failure(selection.provider, legacyProviderOf(selection.provider), 'INTERNAL', describeError(error), selection.model);
+				const payload = failure(selection.provider, resolveDescriptor(ctx, selection.provider, options), 'INTERNAL', describeError(error), selection.model);
 				cache.set(key, { payload, expiresAt: Date.now() + ERROR_CACHE_TTL_MS });
 				return payload;
 			},
@@ -194,7 +195,7 @@ export function apply(ctx, config) {
 						res.end();
 						return;
 					}
-					sendJson(res, 500, failure(options.provider ?? DEFAULT_PROVIDER_ID, undefined, 'INTERNAL', describeError(error), undefined));
+					sendJson(res, 500, failure(options.provider, undefined, 'INTERNAL', describeError(error), undefined));
 				}
 			},
 		}),
@@ -247,8 +248,9 @@ function resolveOptions(config) {
 	const rawBaseUrl = text(source.baseURL);
 	const baseURL = rawBaseUrl !== undefined && URL.canParse(rawBaseUrl) ? rawBaseUrl.replace(/\/+$/, '') : undefined;
 	const region = text(source.region);
+	const configured = text(source.provider);
 	return {
-		provider: text(source.provider),
+		provider: configured === 'auto' ? undefined : configured,
 		apiKeyEnv: text(source.apiKeyEnv),
 		baseURL,
 		region: region === 'cn' || region === 'intl' ? region : undefined,
@@ -270,14 +272,14 @@ const ACCOUNT_ROUTES = new Set(['deepseek-account']);
  * DSH already knows what a route is: its configurable-provider directory entry
  * carries the effective endpoint (`baseURL` / `defaultBaseURL`) and the native
  * credential reference (`nativeAuth.env`). Classifying from those facts means
- * the balance source follows the route that inference actually uses, instead of
- * guessing from its id. First-party routes without a directory entry, and the
- * account route, keep an explicit descriptor; id heuristics are the last resort.
+ * the balance source follows the route that inference actually uses. Routes
+ * without facts fall back to the exact first-party table; anything else stays
+ * unidentified so the bar can say so instead of guessing.
  *
  * @param ctx - plugin context, possibly carrying the `llm` service.
  * @param provider - provider id such as `zai` or `deepseek-official`.
  * @param options - resolved plugin options.
- * @returns the provider descriptor, or undefined when unsupported.
+ * @returns the provider descriptor, or undefined when unidentified.
  */
 function resolveDescriptor(ctx, provider, options) {
 	if (typeof provider !== 'string' || provider.length === 0) return undefined;
@@ -293,9 +295,9 @@ function resolveDescriptor(ctx, provider, options) {
 	const fromEndpoint = descriptorForEndpoint(endpoint);
 	if (fromEndpoint !== undefined) return withCredentialRef(fromEndpoint, options.apiKeyEnv ?? envRef);
 
-	const legacy = legacyProviderOf(provider);
-	if (legacy === undefined) return undefined;
-	return withCredentialRef(legacy, options.apiKeyEnv ?? envRef);
+	const firstParty = Object.hasOwn(FIRST_PARTY_ROUTES, provider) ? FIRST_PARTY_ROUTES[provider] : undefined;
+	if (firstParty === undefined) return undefined;
+	return withCredentialRef(firstParty, options.apiKeyEnv ?? envRef);
 }
 
 /**
@@ -350,24 +352,6 @@ function descriptorForEndpoint(endpoint) {
  */
 function withCredentialRef(descriptor, ref) {
 	return ref === undefined ? descriptor : { ...descriptor, ref };
-}
-
-/**
- * Last-resort id heuristics for routes that publish no directory facts.
- *
- * @param provider - provider id such as `deepseek-official` or `zai`.
- * @returns the provider descriptor, or undefined when unsupported.
- */
-function legacyProviderOf(provider) {
-	if (typeof provider !== 'string') return undefined;
-	if (Object.hasOwn(PROVIDERS, provider)) return PROVIDERS[provider];
-	const id = provider.toLowerCase();
-	if (id === 'deepseek-account' || id.startsWith('deepseek-account-')) return PROVIDERS['deepseek-account'];
-	if (id.includes('deepseek')) return PROVIDERS.deepseek;
-	if (id.includes('zai') || id.includes('glm') || id.includes('zhipu') || id.includes('bigmodel')) {
-		return id.includes('cn') ? PROVIDERS['zai-coding-cn'] : PROVIDERS.zai;
-	}
-	return undefined;
 }
 
 /** Cached DSH client version reported to the account Platform headers. */
