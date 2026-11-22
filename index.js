@@ -8,12 +8,16 @@
  * balances, quota, and status only.
  *
  * Supported providers:
- * - `deepseek` / `deepseek-official` — `GET /user/balance`
+ * - `deepseek-account` — the signed-in DeepSeek account wallets, read through
+ *   the Host `deepseekAccount` service
+ * - `deepseek` / `deepseek-official` — `GET /user/balance` with the API key
  * - `zai` (z.ai) and `zai-coding-cn` (open.bigmodel.cn) — cash account report,
  *   falling back to coding-plan quota limits
  *
  * @module dsh-deepseek-balance
  */
+
+import { readFileSync } from 'node:fs';
 
 const DEFAULT_PROVIDER_ID = 'deepseek-official';
 const DEEPSEEK_BASE_URL = 'https://api.deepseek.com';
@@ -26,13 +30,17 @@ const DEFAULT_CACHE_TTL_MS = 60_000;
 const DEFAULT_TIMEOUT_MS = 10_000;
 const ERROR_CACHE_TTL_MS = 5_000;
 const ROUTE_PATH = '/deepseek-balance';
-const USER_AGENT = 'dsh-deepseek-balance/1.3.0';
+const USER_AGENT = 'dsh-deepseek-balance/1.4.0';
 
 /**
  * Known provider routes. `ref` is the credential reference DSH itself uses for
  * that provider, so no extra configuration is needed when DSH is configured.
  */
 const PROVIDERS = {
+	'deepseek-account': {
+		kind: 'account',
+		name: 'DeepSeek',
+	},
 	deepseek: {
 		kind: 'deepseek',
 		name: 'DeepSeek',
@@ -105,6 +113,7 @@ export function apply(ctx, config) {
 		const { provider, model } = selection;
 		const known = providerOf(provider);
 		if (known === undefined) return { status: 'unsupported', provider, model };
+		if (known.kind === 'account') return readAccountBalance(ctx, known, provider, model);
 
 		let key;
 		try {
@@ -258,11 +267,143 @@ function providerOf(provider) {
 	if (typeof provider !== 'string') return undefined;
 	if (Object.hasOwn(PROVIDERS, provider)) return PROVIDERS[provider];
 	const id = provider.toLowerCase();
+	// The signed-in account route is served by the Host account service, not by
+	// the API-key endpoint; match it before the generic DeepSeek family.
+	if (id === 'deepseek-account' || id.startsWith('deepseek-account-')) return PROVIDERS['deepseek-account'];
 	if (id.includes('deepseek')) return PROVIDERS.deepseek;
 	if (id.includes('zai') || id.includes('glm') || id.includes('zhipu') || id.includes('bigmodel')) {
 		return id.includes('cn') ? PROVIDERS['zai-coding-cn'] : PROVIDERS.zai;
 	}
 	return undefined;
+}
+
+/** Cached DSH client version reported to the account Platform headers. */
+let cachedClientVersion;
+
+/**
+ * Version string for the account Platform headers, taken from the installed
+ * DSH manifest when readable.
+ *
+ * @returns the version, or a neutral fallback.
+ */
+function accountClientVersion() {
+	if (cachedClientVersion !== undefined) return cachedClientVersion;
+	try {
+		const installDir = process.env.DSH_INSTALL_DIR;
+		if (typeof installDir === 'string' && installDir.length > 0) {
+			const manifest = JSON.parse(readFileSync(`${installDir}/package.json`, 'utf8'));
+			if (typeof manifest.version === 'string' && manifest.version.length > 0) {
+				cachedClientVersion = manifest.version;
+				return cachedClientVersion;
+			}
+		}
+	} catch {
+		// Fall through to the neutral value.
+	}
+	cachedClientVersion = '0.0.0';
+	return cachedClientVersion;
+}
+
+/**
+ * Client identity the account service derives its Platform headers from.
+ *
+ * @returns the metadata for one account request.
+ */
+function accountMetadata() {
+	let locale = 'zh-CN';
+	try {
+		locale = Intl.DateTimeFormat().resolvedOptions().locale || locale;
+	} catch {
+		// Keep the default.
+	}
+	return {
+		version: accountClientVersion(),
+		locale,
+		timezoneOffsetSeconds: -new Date().getTimezoneOffset() * 60,
+	};
+}
+
+/**
+ * Read the signed-in DeepSeek account wallets through the Host account service.
+ *
+ * The account route bills the Platform wallets (`normal_wallets` recharge and
+ * `bonus_wallets` gift), so reading the API-key endpoint instead would report
+ * a different account's money.
+ *
+ * @param ctx - plugin context carrying the optional `deepseekAccount` service.
+ * @param known - provider descriptor.
+ * @param provider - provider id to echo.
+ * @param model - model id to echo.
+ * @returns the normalized payload.
+ */
+async function readAccountBalance(ctx, known, provider, model) {
+	const service = ctx.get?.('deepseekAccount');
+	if (service === undefined || typeof service.getBalance !== 'function') {
+		return failure(provider, known, 'ACCOUNT', 'DeepSeek account service is not mounted; sign in from Settings > Account', model);
+	}
+	let outcome;
+	try {
+		outcome = await service.getBalance(accountMetadata());
+	} catch (error) {
+		return failure(provider, known, 'ACCOUNT', describeError(error), model);
+	}
+	if (outcome === null || outcome === undefined) {
+		return { status: 'signed-out', provider, providerName: known.name, model };
+	}
+	if (outcome.status !== 'ready') {
+		return failure(provider, known, 'ACCOUNT', 'the account balance request failed', model);
+	}
+	const balances = mergeAccountWallets(outcome.value, outcome.bonusWallets);
+	if (balances.length === 0) {
+		return failure(provider, known, 'ACCOUNT', 'the account exposes no wallets', model);
+	}
+	return {
+		status: 'ok',
+		provider,
+		providerName: known.name,
+		model,
+		station: 'account',
+		kind: 'cash',
+		currency: balances[0].currency,
+		isAvailable: balances.some((wallet) => numberOrZero(wallet.total) > 0),
+		balances,
+		fetchedAt: Date.now(),
+	};
+}
+
+/**
+ * Fold the recharge and gift wallet lists into one entry per currency.
+ *
+ * @param wallets - `normal_wallets` recharge balances.
+ * @param bonusWallets - `bonus_wallets` gift balances.
+ * @returns one balance entry per currency.
+ */
+function mergeAccountWallets(wallets, bonusWallets) {
+	const byCurrency = new Map();
+	const collect = (list, field) => {
+		if (!Array.isArray(list)) return;
+		for (const wallet of list) {
+			if (wallet === null || typeof wallet !== 'object') continue;
+			const currency = text(wallet.currency);
+			if (currency === undefined) continue;
+			const entry = byCurrency.get(currency) ?? { currency, toppedUp: 0, granted: 0 };
+			entry[field] += numberOrZero(wallet.balance);
+			byCurrency.set(currency, entry);
+		}
+	};
+	collect(wallets, 'toppedUp');
+	collect(bonusWallets, 'granted');
+
+	const balances = [];
+	for (const entry of byCurrency.values()) {
+		balances.push({
+			currency: entry.currency,
+			total: formatAmount(entry.toppedUp + entry.granted),
+			granted: formatAmount(entry.granted),
+			toppedUp: formatAmount(entry.toppedUp),
+		});
+	}
+	return balances;
 }
 
 /**

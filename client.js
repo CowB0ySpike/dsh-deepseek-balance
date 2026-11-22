@@ -16,6 +16,8 @@ window.__ModuleLoader__.load({
         loading: '查询中…',
         refresh: '刷新余额',
         unconfigured: '未配置 API Key',
+        signedOut: '账号未登录',
+        account: '账号',
         unauthorized: 'API Key 无效',
         unsupported: '当前模型不支持余额查询',
         failed: '查询失败',
@@ -40,6 +42,8 @@ window.__ModuleLoader__.load({
         loading: 'Checking…',
         refresh: 'Refresh balance',
         unconfigured: 'No API key configured',
+        signedOut: 'Account not signed in',
+        account: 'Account',
         unauthorized: 'API key is invalid',
         unsupported: 'This model has no balance API',
         failed: 'Balance unavailable',
@@ -108,7 +112,11 @@ window.__ModuleLoader__.load({
     function selectionLine(payload, t) {
       const provider = payload.providerName ?? payload.provider ?? '';
       const model = typeof payload.model === 'string' ? payload.model : '';
-      const station = payload.station === 'cn' ? '智谱中国' : payload.station === 'intl' ? 'z.ai' : '';
+      const station =
+        payload.station === 'cn' ? '智谱中国'
+        : payload.station === 'intl' ? 'z.ai'
+        : payload.station === 'account' ? t('account')
+        : '';
       if (provider.length === 0 && model.length === 0) return '';
       const route = model.length > 0 ? `${provider} / ${model}` : provider;
       return `${t('model')}: ${route}${station.length > 0 ? ` · ${station}` : ''}`;
@@ -191,6 +199,7 @@ window.__ModuleLoader__.load({
     function toView(payload, t) {
       if (payload === null || typeof payload !== 'object') return { kind: 'error', message: t('failed') };
       if (payload.status === 'unconfigured') return { kind: 'unconfigured', provider: payload.providerName };
+      if (payload.status === 'signed-out') return { kind: 'signed-out', provider: payload.providerName };
       if (payload.status === 'unsupported') {
         return { kind: 'unsupported', provider: payload.providerName ?? payload.provider };
       }
@@ -375,6 +384,9 @@ window.__ModuleLoader__.load({
         } else if (view.kind === 'unsupported') {
           text = `${t('label')} · ${t('unsupported')}`;
           title = view.provider === undefined ? undefined : `${t('model')}: ${view.provider}`;
+        } else if (view.kind === 'signed-out') {
+          text = `${t('label')} · ${t('signedOut')}`;
+          title = view.provider === undefined ? undefined : `${t('model')}: ${view.provider} · ${t('account')}`;
         } else if (view.kind === 'error') {
           text = `${t('label')} · ${view.message}`;
           color = 'var(--dsw-alias-state-error-primary)';

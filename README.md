@@ -31,11 +31,14 @@ GLM        GLM 额度 5 小时 92% · 本周 79% ↻
 
 | 供应商路由 | 默认凭据引用 | 数据来源 | 显示 |
 | --- | --- | --- | --- |
-| `deepseek-official` / `deepseek` | `DEEPSEEK_API_KEY` | `GET https://api.deepseek.com/user/balance` | 现金余额（¥） |
+| `deepseek-account` | 无需配置（账号登录） | DSH 的 `deepseekAccount` 服务 → Platform 钱包（`normal_wallets` 充值 + `bonus_wallets` 赠送） | 账号现金余额（¥ / $）；未登录时提示「账号未登录」 |
+| `deepseek-official` / `deepseek` | `DEEPSEEK_API_KEY` | `GET https://api.deepseek.com/user/balance` | API Key 现金余额（¥） |
 | `zai` | `ZAI_API_KEY` | `open.bigmodel.cn` 与 `api.z.ai` 的 `/api/biz/account/query-customer-account-report`，失败时回退 `/api/monitor/usage/quota/limit`；另查 `/api/biz/tokenAccounts/list/my` | 现金余额（自动判定 ¥ / $）、额度百分比、赠送资源包 |
 | `zai-coding-cn` | `ZAI_CODING_CN_API_KEY` | 仅 `open.bigmodel.cn`：`/api/biz/account/query-customer-account-report`，失败时回退 `/api/monitor/usage/quota/limit`；另查 `/api/biz/tokenAccounts/list/my` | 现金余额（¥）、额度百分比、赠送资源包 |
 
 其它路由（OpenAI、Anthropic、Kimi、MiniMax 等）会显示「当前模型不支持余额查询」，并且可以随时通过 `provider` 配置覆盖。
+
+> **账号登录与 API Key 是两套余额**：用 `deepseek-account`（浏览器登录）时，插件读取账号钱包；用 `deepseek-official` / `deepseek`（API Key）时才读 `api.deepseek.com/user/balance`。两者互不混用，避免在账号模式下错误显示 API Key 的余额。
 
 > GLM 的 Coding Plan 没有现金余额接口，只能查询额度，所以显示的是「5 小时 / 本周」的剩余百分比；标准 API Key 若账户有现金余额，则显示金额而不是百分比。
 >
@@ -92,7 +95,7 @@ GLM        GLM 额度 5 小时 92% · 本周 79% ↻
 - id: deepseek-balance
   name: dsh-deepseek-balance
   config:
-    provider: auto                # auto | deepseek-official | zai | zai-coding-cn
+    provider: auto                # auto | deepseek-account | deepseek-official | zai | zai-coding-cn
     region: auto                  # auto | cn | intl（GLM 站点，auto 会同时探测两站）
     # apiKeyEnv: ZAI_API_KEY      # 覆盖凭据引用名
     # baseURL: https://api.z.ai   # 覆盖当前供应商的上游地址
@@ -170,6 +173,7 @@ GET /deepseek-balance?refresh=1                        # 强制刷新
 其它状态：
 
 - `{ "status": "unsupported", "provider": "openai", "model": "gpt-5.6" }`
+- `{ "status": "signed-out", "provider": "deepseek-account", "providerName": "DeepSeek" }`（账号未登录）
 - `{ "status": "unconfigured", "provider": "zai", "providerName": "GLM", "ref": "ZAI_API_KEY" }`
 - `{ "status": "error", "provider": "zai", "code": "...", "message": "...", "model": "glm-5.3" }`，`code` 取值为
   `CREDENTIALS | UNAUTHORIZED | NETWORK | TIMEOUT | HTTP | RESPONSE | INTERNAL`
@@ -229,6 +233,7 @@ A DSH (DeepSeek Harness) plugin that shows the account balance — or plan quota
 - **GLM / z.ai**: cash report (`/api/biz/account/query-customer-account-report`), falling back to the coding-plan quota (`/api/monitor/usage/quota/limit`) for subscription keys.
 - **Automatic station detection**: a `zai` key may belong to the 智谱 China site or to z.ai, so both are queried; a funded China account wins (CNY), otherwise the z.ai account is used (USD). `region: cn | intl` pins one.
 - **Token packages**: granted 资源包 (`/api/biz/tokenAccounts/list/my`) are detailed in the tooltip as remaining/grant with model and expiry; the dock row stays compact.
+- **Account route**: `deepseek-account` reads the signed-in account's wallets through DSH's `deepseekAccount` service instead of the API-key endpoint; `deepseek-official` / `deepseek` keep using `GET /user/balance`.
 - The API key never leaves the Host process; the browser only reads the same-origin `/deepseek-balance` route.
 
 ### Install

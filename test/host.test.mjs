@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { apply } from '../index.js';
 
 /** Build a plugin context double that records the registered route. */
-function makeContext(defaultProvider) {
+function makeContext(defaultProvider, accountService) {
   const routes = [];
   const ctx = {
     effect(fn) {
@@ -14,6 +14,7 @@ function makeContext(defaultProvider) {
       if (name === 'agentDefaultModel' && defaultProvider !== undefined) {
         return { currentSelection: () => ({ provider: defaultProvider, model: 'test-model' }) };
       }
+      if (name === 'deepseekAccount' && accountService !== undefined) return accountService;
       return undefined;
     },
     credentials: {
@@ -355,8 +356,7 @@ test('maps a 401 to UNAUTHORIZED', async () => {
   }
 });
 
-test('answers non-GET requests with 405', async () => {
-  const { ctx, routes } = makeContext('deepseek-official');
+test('answers non-GET requests with 405', async () => {  const { ctx, routes } = makeContext('deepseek-official');
   apply(ctx, {});
   const { status } = await callRoute(routes, '/deepseek-balance', 'POST');
   assert.equal(status, 405);
@@ -383,4 +383,53 @@ test('debug=1 returns the raw GLM rows for the answering stations', async () => 
   } finally {
     restore();
   }
+});
+
+test('reads the signed-in DeepSeek account wallets instead of the API key balance', async () => {
+  const restore = withFetch(async () => {
+    throw new Error('the account route must not call the API-key endpoint');
+  });
+  try {
+    const accountService = {
+      async getBalance(metadata) {
+        assert.equal(typeof metadata.version, 'string');
+        assert.equal(typeof metadata.timezoneOffsetSeconds, 'number');
+        return {
+          status: 'ready',
+          value: [{ currency: 'CNY', balance: '12.34' }],
+          bonusWallets: [{ currency: 'CNY', balance: '5.00' }],
+        };
+      },
+    };
+    const { ctx, routes } = makeContext('deepseek-account', accountService);
+    apply(ctx, {});
+    const { payload } = await callRoute(routes, '/deepseek-balance');
+    assert.equal(payload.status, 'ok');
+    assert.equal(payload.provider, 'deepseek-account');
+    assert.equal(payload.kind, 'cash');
+    assert.equal(payload.station, 'account');
+    assert.equal(payload.currency, 'CNY');
+    assert.deepEqual(payload.balances, [
+      { currency: 'CNY', total: '17.34', granted: '5.00', toppedUp: '12.34' },
+    ]);
+    assert.equal(payload.isAvailable, true);
+  } finally {
+    restore();
+  }
+});
+
+test('reports a signed-out DeepSeek account', async () => {
+  const { ctx, routes } = makeContext('deepseek-account', { async getBalance() { return null; } });
+  apply(ctx, {});
+  const { payload } = await callRoute(routes, '/deepseek-balance');
+  assert.equal(payload.status, 'signed-out');
+  assert.equal(payload.provider, 'deepseek-account');
+});
+
+test('reports a missing DeepSeek account service', async () => {
+  const { ctx, routes } = makeContext('deepseek-account');
+  apply(ctx, {});
+  const { payload } = await callRoute(routes, '/deepseek-balance');
+  assert.equal(payload.status, 'error');
+  assert.equal(payload.code, 'ACCOUNT');
 });
