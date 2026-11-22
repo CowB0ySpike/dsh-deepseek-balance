@@ -38,6 +38,8 @@ GLM        GLM 额度 5 小时 92% · 本周 79% ↻
 
 其它路由（OpenAI、Anthropic、Kimi、MiniMax 等）会显示「当前模型不支持余额查询」，并且可以随时通过 `provider` 配置覆盖。
 
+> 表里的「默认凭据引用」只是兜底值：实际优先取该路由在 DSH provider 目录里的 `nativeAuth.env`，因此自定义路由换了环境变量也能对上。
+
 > **账号登录与 API Key 是两套余额**：用 `deepseek-account`（浏览器登录）时，插件读取账号钱包；用 `deepseek-official` / `deepseek`（API Key）时才读 `api.deepseek.com/user/balance`。两者互不混用，避免在账号模式下错误显示 API Key 的余额。
 
 > GLM 的 Coding Plan 没有现金余额接口，只能查询额度，所以显示的是「5 小时 / 本周」的剩余百分比；标准 API Key 若账户有现金余额，则显示金额而不是百分比。
@@ -184,16 +186,26 @@ GET /deepseek-balance?refresh=1                        # 强制刷新
 
 | 文件 | 作用 |
 | --- | --- |
-| `index.js` | **Host 半部**：判断当前供应商 → 解析凭据 → 调用对应余额/额度接口 → 缓存 → 注册 `GET /deepseek-balance` |
-| `client.js` | **浏览器半部**：在 `conversation.composer.dock` 注册 React 组件，读取模型控件上的 `data-provider-id` / `data-model-id` 作为提示，`fetch` 同源路由并渲染 |
+| `index.js` | **Host 半部**：按路由事实判定余额来源 → 解析凭据 → 调用对应余额/额度接口 → 缓存 → 注册 `GET /deepseek-balance` |
+| `client.js` | **浏览器半部**：在 `conversation.composer.dock` 注册 React 组件，从会话的模型目录读当前选择，`fetch` 同源路由并渲染 |
 | `cordis.patch.yml` | 向 profile 插入插件行的 bundle patch |
 | `locale/*.json` | 插件在设置页/市场里的中英文名称与简介 |
 | `icon.svg` | 插件图标 |
 
-- 供应商判定顺序：页面提示（模型控件）→ 配置项 `provider` → DSH 默认模型（`agentDefaultModel.currentSelection()`）→ `deepseek-official`。
+### 判定逻辑（精确优先）
+
+1. **当前模型**：客户端通过 slot 的 `inject(sessionId)` 拿到 DSH 的 `modelDirectories.directoryFor(sessionId).store`——这正是输入框模型控件渲染的同一份数据；用 `useSyncExternalStore` 订阅，切换模型立即重查。目录服务不可用时才退回读取标签上的 `data-provider-id` / `data-model-id`。
+2. **余额来源**：Host 用 `ctx.llm.listConfigurableProviders()` 查该 provider 的目录条目，按**事实**判定：
+   - `nativeAuth.env` → 该路由实际使用的凭据引用（不再写死 `ZAI_API_KEY` 等）
+   - `baseURL` / `defaultBaseURL` 的域名 → `api.deepseek.com` 现金余额、`open.bigmodel.cn` 智谱中国站、`api.z.ai` z.ai
+3. **首方路由**：不发布目录条目的 `deepseek-official` / `deepseek`，以及账号路由 `deepseek-account`，用显式表判定；后者走 `deepseekAccount` 服务读 Platform 钱包。
+4. **兜底**：仍无法判定时才用 provider id 子串（含 `zai` / `glm` / `bigmodel` 等），最后回退 `deepseek-official`。
+
+其余规则：
+
 - GLM 站点判定：`auto` 时并发查询智谱中国站与 z.ai，取有金额的一站；两站都有金额时优先中国站（¥）。`region` / `baseURL` 可固定站点与币种。
 - Host 通过 `inject = ['credentials', 'webServer']` 取得凭据服务与 Web 载体，用 `ctx.effect()` 绑定路由生命周期。
-- Client 通过 `inject = ['slots', 'locale']` 注册槽位条目与两份 locale 词典，并用 `MutationObserver` 监听模型切换。
+- Client 通过 `inject = ['slots', 'locale']` 注册槽位条目与两份 locale 词典。
 - 浏览器只与之通信的同源路由不带 CORS，凭据值从不进入响应、也不会写入日志。
 
 ## 安全说明

@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { apply } from '../index.js';
 
 /** Build a plugin context double that records the registered route. */
-function makeContext(defaultProvider, accountService) {
+function makeContext(defaultProvider, extra = {}) {
   const routes = [];
   const ctx = {
     effect(fn) {
@@ -14,7 +14,8 @@ function makeContext(defaultProvider, accountService) {
       if (name === 'agentDefaultModel' && defaultProvider !== undefined) {
         return { currentSelection: () => ({ provider: defaultProvider, model: 'test-model' }) };
       }
-      if (name === 'deepseekAccount' && accountService !== undefined) return accountService;
+      if (name === 'deepseekAccount' && extra.accountService !== undefined) return extra.accountService;
+      if (name === 'llm' && extra.llm !== undefined) return extra.llm;
       return undefined;
     },
     credentials: {
@@ -401,7 +402,7 @@ test('reads the signed-in DeepSeek account wallets instead of the API key balanc
         };
       },
     };
-    const { ctx, routes } = makeContext('deepseek-account', accountService);
+    const { ctx, routes } = makeContext('deepseek-account', { accountService });
     apply(ctx, {});
     const { payload } = await callRoute(routes, '/deepseek-balance');
     assert.equal(payload.status, 'ok');
@@ -419,7 +420,7 @@ test('reads the signed-in DeepSeek account wallets instead of the API key balanc
 });
 
 test('reports a signed-out DeepSeek account', async () => {
-  const { ctx, routes } = makeContext('deepseek-account', { async getBalance() { return null; } });
+  const { ctx, routes } = makeContext('deepseek-account', { accountService: { async getBalance() { return null; } } });
   apply(ctx, {});
   const { payload } = await callRoute(routes, '/deepseek-balance');
   assert.equal(payload.status, 'signed-out');
@@ -432,4 +433,57 @@ test('reports a missing DeepSeek account service', async () => {
   const { payload } = await callRoute(routes, '/deepseek-balance');
   assert.equal(payload.status, 'error');
   assert.equal(payload.code, 'ACCOUNT');
+});
+
+test('classifies a route from its directory endpoint and credential', async () => {
+  const { ctx, routes } = makeContext('custom-ds', {
+    llm: {
+      listConfigurableProviders: () => [
+        {
+          provider: 'custom-ds',
+          displayName: 'Custom DS',
+          baseURL: 'https://api.deepseek.com/anthropic',
+          nativeAuth: { env: ['CUSTOM_DS_KEY'], oauth: false },
+        },
+      ],
+    },
+  });
+  ctx.credentials.describe = async () => ({ configured: false });
+  apply(ctx, {});
+  const { payload } = await callRoute(routes, '/deepseek-balance');
+  assert.equal(payload.status, 'unconfigured');
+  assert.equal(payload.ref, 'CUSTOM_DS_KEY');
+});
+
+test('classifies a GLM route from its directory endpoint without id heuristics', async () => {
+  const restore = withFetch(async (url, init) => {
+    assert.match(url, /^https:\/\/open\.bigmodel\.cn\//);
+    assert.equal(init.headers.authorization, 'Bearer test-key');
+    if (url.includes('tokenAccounts/list/my')) {
+      return new Response(JSON.stringify({ code: 200, rows: [] }), { status: 200 });
+    }
+    return new Response(JSON.stringify(cashBody(3)), { status: 200 });
+  });
+  try {
+    const { ctx, routes } = makeContext('custom-glm', {
+      llm: {
+        listConfigurableProviders: () => [
+          {
+            provider: 'custom-glm',
+            displayName: 'Custom GLM',
+            baseURL: 'https://open.bigmodel.cn/api/paas/v4',
+            nativeAuth: { env: ['CUSTOM_GLM_KEY'], oauth: false },
+          },
+        ],
+      },
+    });
+    apply(ctx, {});
+    const { payload } = await callRoute(routes, '/deepseek-balance');
+    assert.equal(payload.status, 'ok');
+    assert.equal(payload.kind, 'cash');
+    assert.equal(payload.station, 'cn');
+    assert.equal(payload.currency, 'CNY');
+  } finally {
+    restore();
+  }
 });

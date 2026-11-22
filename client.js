@@ -300,16 +300,53 @@ window.__ModuleLoader__.load({
 
       const t = (key) => ctx.locale.bind(NS)(key);
 
+      /** Empty store used when the model directory service is unavailable. */
+      const EMPTY_STORE = Object.freeze({
+        getSnapshot: () => undefined,
+        subscribe: () => () => {},
+      });
+
+      /**
+       * Read the session's model selection from DSH's model directory — the same
+       * store the composer's model seat renders — falling back to the label's
+       * data attributes only when the directory is unavailable.
+       * @param {object} store - directory store, or the empty store.
+       * @returns {{ provider: string, model?: string } | undefined} the selection.
+       */
+      function selectionOf(store) {
+        const current = store.getSnapshot?.()?.current;
+        if (current !== null && typeof current === 'object' && typeof current.provider === 'string' && current.provider.length > 0) {
+          return {
+            provider: current.provider,
+            model: typeof current.model === 'string' && current.model.length > 0 ? current.model : undefined,
+          };
+        }
+        return readSelectionHint();
+      }
+
       /**
        * One ambient dock row: the balance text and a refresh control.
+       * @param {object} props - slot props carrying the optional selection store.
        * @returns {object} the React element.
        */
-      function BalanceDock() {
+      function BalanceDock(props) {
+        const directoryStore = props?.selectionStore;
+        const store = directoryStore ?? EMPTY_STORE;
         const [view, setView] = React.useState({ kind: 'loading' });
         const [busy, setBusy] = React.useState(true);
         const alive = React.useRef(true);
-        const hint = React.useRef(readSelectionHint());
         const sequence = React.useRef(0);
+
+        const subscribe = React.useCallback((listener) => store.subscribe(listener), [store]);
+        const getSnapshot = React.useCallback(() => store.getSnapshot(), [store]);
+        // Subscribing to the directory makes the row follow every model switch
+        // without scraping the DOM.
+        React.useSyncExternalStore(subscribe, getSnapshot);
+
+        const selection = selectionOf(store);
+        const hint = React.useRef(selection);
+        hint.current = selection;
+        const hintKey = `${selection?.provider ?? ''}\u0000${selection?.model ?? ''}`;
 
         const load = React.useCallback((force) => {
           const controller = new AbortController();
@@ -342,15 +379,21 @@ window.__ModuleLoader__.load({
         }, []);
 
         React.useEffect(() => {
+          props?.warmSelection?.();
+        }, []);
+
+        React.useEffect(() => {
           alive.current = true;
+          setView({ kind: 'loading' });
           const cancel = load(false);
           return () => {
             alive.current = false;
             cancel();
           };
-        }, [load]);
+        }, [hintKey, load]);
 
         React.useEffect(() => {
+          if (directoryStore !== undefined) return undefined;
           let timer;
           const check = () => {
             const next = readSelectionHint();
@@ -359,7 +402,6 @@ window.__ModuleLoader__.load({
             if (!changed) return;
             hint.current = next;
             setView({ kind: 'loading' });
-            load(false);
           };
           const observer = new MutationObserver(() => {
             clearTimeout(timer);
@@ -375,7 +417,7 @@ window.__ModuleLoader__.load({
             observer.disconnect();
             clearTimeout(timer);
           };
-        }, [load]);
+        }, [directoryStore]);
 
         let text;
         let color = 'var(--dsw-alias-label-secondary)';
@@ -468,7 +510,31 @@ window.__ModuleLoader__.load({
       }
 
       ctx.effect(() =>
-        ctx.slots.inject(SLOT, () => ctx.slots.register({ name: SLOT, id: ENTRY_ID, order: 2 }, BalanceDock)),
+        ctx.slots.inject(SLOT, () =>
+          ctx.slots.register(
+            {
+              name: SLOT,
+              id: ENTRY_ID,
+              order: 2,
+              inject: (sessionId) => {
+                const models = ctx.get?.('modelDirectories');
+                if (models === undefined) return {};
+                try {
+                  const directory = models.directoryFor(sessionId);
+                  return {
+                    selectionStore: directory.store,
+                    warmSelection: () => {
+                      directory.load().catch(() => {});
+                    },
+                  };
+                } catch {
+                  return {};
+                }
+              },
+            },
+            BalanceDock,
+          ),
+        ),
       );
     }
 

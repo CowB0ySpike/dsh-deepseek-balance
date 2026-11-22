@@ -30,7 +30,7 @@ const DEFAULT_CACHE_TTL_MS = 60_000;
 const DEFAULT_TIMEOUT_MS = 10_000;
 const ERROR_CACHE_TTL_MS = 5_000;
 const ROUTE_PATH = '/deepseek-balance';
-const USER_AGENT = 'dsh-deepseek-balance/1.4.0';
+const USER_AGENT = 'dsh-deepseek-balance/1.5.0';
 
 /**
  * Known provider routes. `ref` is the credential reference DSH itself uses for
@@ -111,13 +111,13 @@ export function apply(ctx, config) {
 	 */
 	async function readBalance(selection) {
 		const { provider, model } = selection;
-		const known = providerOf(provider);
+		const known = resolveDescriptor(ctx, provider, options);
 		if (known === undefined) return { status: 'unsupported', provider, model };
 		if (known.kind === 'account') return readAccountBalance(ctx, known, provider, model);
 
 		let key;
 		try {
-			const ref = options.apiKeyEnv ?? known.ref;
+			const ref = known.ref;
 			const info = await ctx.credentials.describe(ref);
 			if (info === undefined || info.configured !== true) {
 				return { status: 'unconfigured', provider, providerName: known.name, ref, model };
@@ -160,7 +160,7 @@ export function apply(ctx, config) {
 			},
 			(error) => {
 				inflight.delete(key);
-				const payload = failure(selection.provider, providerOf(selection.provider), 'INTERNAL', describeError(error), selection.model);
+				const payload = failure(selection.provider, legacyProviderOf(selection.provider), 'INTERNAL', describeError(error), selection.model);
 				cache.set(key, { payload, expiresAt: Date.now() + ERROR_CACHE_TTL_MS });
 				return payload;
 			},
@@ -212,11 +212,11 @@ export function apply(ctx, config) {
  * @returns raw per-station responses.
  */
 async function debugPayload(ctx, options, provider) {
-	const known = providerOf(provider);
+	const known = resolveDescriptor(ctx, provider, options);
 	if (known === undefined || known.kind !== 'glm') {
 		return { note: 'debug is only implemented for GLM routes', provider };
 	}
-	const ref = options.apiKeyEnv ?? known.ref;
+	const ref = known.ref;
 	const resolved = await ctx.credentials.resolve(ref);
 	if (resolved === undefined || typeof resolved.value !== 'string' || resolved.value.length === 0) {
 		return { note: 'credential is not configured', ref };
@@ -258,17 +258,110 @@ function resolveOptions(config) {
 }
 
 /**
- * Map a DSH provider route onto its balance endpoint.
+ * First-party routes that authenticate through the signed-in DeepSeek account
+ * and bill the Platform wallets. The account adapter is the only such route
+ * today; adding another is a one-line change here.
+ */
+const ACCOUNT_ROUTES = new Set(['deepseek-account']);
+
+/**
+ * Resolve a provider route to its balance source.
+ *
+ * DSH already knows what a route is: its configurable-provider directory entry
+ * carries the effective endpoint (`baseURL` / `defaultBaseURL`) and the native
+ * credential reference (`nativeAuth.env`). Classifying from those facts means
+ * the balance source follows the route that inference actually uses, instead of
+ * guessing from its id. First-party routes without a directory entry, and the
+ * account route, keep an explicit descriptor; id heuristics are the last resort.
+ *
+ * @param ctx - plugin context, possibly carrying the `llm` service.
+ * @param provider - provider id such as `zai` or `deepseek-official`.
+ * @param options - resolved plugin options.
+ * @returns the provider descriptor, or undefined when unsupported.
+ */
+function resolveDescriptor(ctx, provider, options) {
+	if (typeof provider !== 'string' || provider.length === 0) return undefined;
+	if (ACCOUNT_ROUTES.has(provider) || provider.startsWith('deepseek-account-')) {
+		return { kind: 'account', name: 'DeepSeek' };
+	}
+
+	const entry = directoryEntryOf(ctx, provider);
+	const envRef = Array.isArray(entry?.nativeAuth?.env) ? text(entry.nativeAuth.env[0]) : undefined;
+	const endpoint = typeof entry?.baseURL === 'string' ? entry.baseURL
+		: typeof entry?.defaultBaseURL === 'string' ? entry.defaultBaseURL
+		: undefined;
+	const fromEndpoint = descriptorForEndpoint(endpoint);
+	if (fromEndpoint !== undefined) return withCredentialRef(fromEndpoint, options.apiKeyEnv ?? envRef);
+
+	const legacy = legacyProviderOf(provider);
+	if (legacy === undefined) return undefined;
+	return withCredentialRef(legacy, options.apiKeyEnv ?? envRef);
+}
+
+/**
+ * Read one route's configurable-provider entry from the LLM directory.
+ *
+ * @param ctx - plugin context.
+ * @param provider - provider id.
+ * @returns the directory entry, or undefined.
+ */
+function directoryEntryOf(ctx, provider) {
+	try {
+		const entries = ctx.get?.('llm')?.listConfigurableProviders?.();
+		if (!Array.isArray(entries)) return undefined;
+		return entries.find((entry) => entry?.provider === provider);
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Pick the balance source from the endpoint a route actually talks to.
+ *
+ * @param endpoint - configured or default provider base URL.
+ * @returns the descriptor, or undefined for an unknown endpoint.
+ */
+function descriptorForEndpoint(endpoint) {
+	if (typeof endpoint !== 'string' || endpoint.length === 0) return undefined;
+	let host;
+	try {
+		host = new URL(endpoint).hostname.toLowerCase();
+	} catch {
+		return undefined;
+	}
+	if (host === 'api.deepseek.com') {
+		return { kind: 'deepseek', name: 'DeepSeek', ref: 'DEEPSEEK_API_KEY', host: DEEPSEEK_BASE_URL, currency: 'CNY' };
+	}
+	if (host === 'open.bigmodel.cn') {
+		return { kind: 'glm', name: 'GLM', ref: 'ZAI_CODING_CN_API_KEY', host: BIGMODEL_HOST, currency: 'CNY' };
+	}
+	if (host === 'api.z.ai' || host.endsWith('.z.ai')) {
+		return { kind: 'glm', name: 'GLM', ref: 'ZAI_API_KEY', host: ZAI_HOST, currency: 'USD' };
+	}
+	return undefined;
+}
+
+/**
+ * Override a descriptor's credential reference when one is known.
+ *
+ * @param descriptor - the resolved descriptor.
+ * @param ref - credential reference, when known.
+ * @returns the descriptor with the reference applied.
+ */
+function withCredentialRef(descriptor, ref) {
+	return ref === undefined ? descriptor : { ...descriptor, ref };
+}
+
+/**
+ * Last-resort id heuristics for routes that publish no directory facts.
  *
  * @param provider - provider id such as `deepseek-official` or `zai`.
  * @returns the provider descriptor, or undefined when unsupported.
  */
-function providerOf(provider) {
+function legacyProviderOf(provider) {
 	if (typeof provider !== 'string') return undefined;
 	if (Object.hasOwn(PROVIDERS, provider)) return PROVIDERS[provider];
 	const id = provider.toLowerCase();
-	// The signed-in account route is served by the Host account service, not by
-	// the API-key endpoint; match it before the generic DeepSeek family.
 	if (id === 'deepseek-account' || id.startsWith('deepseek-account-')) return PROVIDERS['deepseek-account'];
 	if (id.includes('deepseek')) return PROVIDERS.deepseek;
 	if (id.includes('zai') || id.includes('glm') || id.includes('zhipu') || id.includes('bigmodel')) {
