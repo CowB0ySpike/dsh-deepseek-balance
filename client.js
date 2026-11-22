@@ -18,6 +18,7 @@ window.__ModuleLoader__.load({
         unconfigured: '未配置 API Key',
         signedOut: '账号未登录',
         account: '账号',
+        accountSuffix: ' 账号',
         unauthorized: 'API Key 无效',
         unsupported: '当前模型不支持余额查询',
         failed: '查询失败',
@@ -44,6 +45,7 @@ window.__ModuleLoader__.load({
         unconfigured: 'No API key configured',
         signedOut: 'Account not signed in',
         account: 'Account',
+        accountSuffix: ' account',
         unauthorized: 'API key is invalid',
         unsupported: 'This model has no balance API',
         failed: 'Balance unavailable',
@@ -112,13 +114,14 @@ window.__ModuleLoader__.load({
     function selectionLine(payload, t) {
       const provider = payload.providerName ?? payload.provider ?? '';
       const model = typeof payload.model === 'string' ? payload.model : '';
+      const isAccount = payload.station === 'account';
       const station =
         payload.station === 'cn' ? '智谱中国'
         : payload.station === 'intl' ? 'z.ai'
-        : payload.station === 'account' ? t('account')
         : '';
       if (provider.length === 0 && model.length === 0) return '';
-      const route = model.length > 0 ? `${provider} / ${model}` : provider;
+      const name = isAccount ? `${provider}${t('accountSuffix')}` : provider;
+      const route = model.length > 0 ? `${name} / ${model}` : name;
       return `${t('model')}: ${route}${station.length > 0 ? ` · ${station}` : ''}`;
     }
 
@@ -386,7 +389,7 @@ window.__ModuleLoader__.load({
           title = view.provider === undefined ? undefined : `${t('model')}: ${view.provider}`;
         } else if (view.kind === 'signed-out') {
           text = `${t('label')} · ${t('signedOut')}`;
-          title = view.provider === undefined ? undefined : `${t('model')}: ${view.provider} · ${t('account')}`;
+          title = view.provider === undefined ? undefined : `${t('model')}: ${view.provider}${t('accountSuffix')}`;
         } else if (view.kind === 'error') {
           text = `${t('label')} · ${view.message}`;
           color = 'var(--dsw-alias-state-error-primary)';
